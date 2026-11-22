@@ -761,7 +761,7 @@
 +        else
 +            DestroyImage(*p);
 +        p.reset();
-+    }
+     }
 +    p = MakeImage(d.width, d.height, d.depth, d.levels, d.cube ? 6 : 1, FormatOf(fi.host, bc_supported_), false, false);
 +    p->desc = d;
 +    if (static int tex_logged = 0; tex_logged < 24) {
