@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Tag versi rilis Android (contoh: v0.8.0-android.3)'
+        description: 'Tag versi rilis Android (contoh: v0.8.0-android.4)'
         required: true
-        default: 'v0.8.0-android.3'
+        default: 'v0.8.0-android.4'
         type: string
       publish_release:
         description: 'Publikasikan langsung ke GitHub Releases'
@@ -124,7 +124,7 @@ jobs:
         run: |
           VERSION="${{ inputs.release_version || github.ref_name }}"
           if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
-            VERSION="v0.8.0-android.3"
+            VERSION="v0.8.0-android.4"
           fi
           CLEAN_NAME="${VERSION#v}"
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
@@ -167,8 +167,9 @@ jobs:
             ### Genma Onimusha — Android ARM64 Port (${{ steps.ver.outputs.tag }})
 
             - **Fitur & Perbaikan baru pada rilis ini**:
-              - Menambahkan **Touch Controls Overlay visual** (`TouchOverlayView`) langsung di atas layar SDL3: Virtual Left Analog Stick, D-Pad, tombol Xbox (**A / B / X / Y**), shoulder (**LB / RB / LT / RT**), **START**, **BACK**, serta tombol **PAD** (toggle tampil/sembunyi).
-              - Menambahkan log `LOGR` format tekstur (`vulkan: tex#...`) ke `genma.log` untuk mengisolasi akar masalah *Texture Atlas Corruption* pada title screen.
+              - **Perbaikan Texture & Framebuffer Corruption**: Membatasi lookup `palette` hanya untuk format `P8` (`0x0B`) swizzled agar tekstur `DXT1/3/5` & `LIN_X8R8G8B8` tidak melewati `DecodeDxtCpu()` atau mengalami *buffer over-read* dari staging arena; membersihkan render target warna baru ke hitam pada awal pembuatan (`vkCmdClearColorImage`).
+              - **Perbaikan Slow-Motion (~6–11 FPS -> 60 FPS target)**: Mengganti full-buffer CPU hashing pada setiap `Draw()`/`Target()` dengan sampling cepat `MemSig` + `DirtyEpoch` per-frame caching; menjaga `VkRenderPass` tetap terbuka antar-draw (`BeginRender`/`EndRender`) dan menghapus redundant `VK_PIPELINE_STAGE_ALL_COMMANDS_BIT` barriers untuk GPU TBDR Adreno; menambahkan 2-frame double buffering (`kFrames = 2`) dan shader LUT GPU untuk gamma non-identitas (tanpa CPU `Read()` stall).
+              - Menambahkan pencatatan `fps` dan `ms/frame` ke log setiap 60 frame untuk verifikasi performa.
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`, 16 KB page-aligned
           files: |
             release-dist/*.apk

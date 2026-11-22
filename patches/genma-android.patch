@@ -11,7 +11,15 @@
  #endif
 --- a/sdk/runtime/gpu/vulkan.cpp
 +++ b/sdk/runtime/gpu/vulkan.cpp
-@@ -12,8 +12,10 @@
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <bit>
++#include <chrono>
+ #include <cmath>
+ #include <cstring>
+ #include <filesystem>
+@@ -12,8 +13,10 @@
  #include <fcntl.h>
  #include <map>
  #include <memory>
@@ -22,7 +30,7 @@
  #include <unistd.h>
  #include <vector>
  #include "app/app.h"
-@@ -23,6 +25,10 @@
+@@ -23,6 +26,10 @@
  #include "gpu/texture.h"
  #include "gpu/vertex.h"
  #include "kernel/kernel.h"
@@ -33,7 +41,7 @@
  extern char **environ;
  namespace app {
  Mode LinuxWindowSize();
-@@ -136,16 +142,16 @@
+@@ -136,16 +143,16 @@
          return VK_SAMPLER_ADDRESS_MODE_REPEAT;
      }
  }
@@ -54,20 +62,160 @@
      case Host::R32F:
          return VK_FORMAT_R32_SFLOAT;
      case Host::R16Unorm:
-@@ -208,6 +214,12 @@
+@@ -154,6 +161,27 @@
+         Fail("unsupported texture format");
+     }
+ }
++constexpr uint32_t kSigWholeMax = 65536;
++constexpr uint32_t kSigSamples = 64;
++constexpr uint32_t kSigSampleBytes = 64;
++
++uint64_t MemSig(uint32_t data, uint32_t total) {
++    const uint8_t *p = static_cast<const uint8_t *>(kernel::HostPtr(data));
++    uint64_t sig = Hash(&total, sizeof(total));
++    if (!total)
++        return sig;
++    if (total <= kSigWholeMax)
++        return Hash(p, total, sig);
++    for (uint32_t i = 0; i < kSigSamples; i++) {
++        const uint8_t *sample = p + uint64_t(total - kSigSampleBytes) * i / (kSigSamples - 1);
++        sig = Hash(sample, kSigSampleBytes, sig);
++    }
++    return sig;
++}
++bool SameTextureDesc(const TextureDesc &a, const TextureDesc &b) {
++    return a.format == b.format && a.width == b.width && a.height == b.height && a.depth == b.depth &&
++           a.levels == b.levels && a.cube == b.cube && a.linear == b.linear && a.pitch == b.pitch;
++}
+ struct Image {
+     VkImage image{};
+     VkDeviceMemory memory{};
+@@ -162,14 +190,28 @@
+     VkFormat format{};
+     uint32_t w = 0, h = 0, depth = 1, levels = 1, layers = 1;
+     bool z = false, drawn = false;
+-    uint64_t epoch = ~0ull, signature = 0, used = 0;
++    uint64_t epoch = ~0ull, signature = 0, palette_hash = 0, used = 0, checked_frame = 0;
+     TextureDesc desc{};
+ };
++struct FrameSlot {
++    VkCommandPool pool{};
++    VkCommandBuffer cmd{};
++    VkSemaphore acquired{};
++    VkFence fence{};
++    VkDescriptorPool descriptor_pool{};
++    VkDeviceSize base = 0, used = 0;
++    bool recording = false, submitted = false;
++    uint32_t query_next = 0, report_first = 0;
++    std::vector<std::unique_ptr<Image>> retire;
++};
+ VkImageAspectFlags Aspects(bool z) {
+     return z ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+              : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
+ }
+ class Vulkan final : public Backend {
++    static constexpr uint32_t kFrames = 2;
++    static constexpr VkDeviceSize kFrameArena = 64ull << 20;
++    static constexpr VkDeviceSize kArena = kFrameArena * kFrames;
+     VkInstance instance_{};
+     VkSurfaceKHR surface_{};
+     VkPhysicalDevice physical_{};
+@@ -177,46 +219,60 @@
+     VkQueue queue_{};
+     uint32_t family_ = 0;
+     VkPhysicalDeviceMemoryProperties memory_{};
+-    VkCommandPool pool_{};
+-    VkCommandBuffer cmd_{};
+-    bool recording_ = false;
++    std::array<FrameSlot, kFrames> slots_{};
++    uint32_t slot_ = 0;
+     VkSwapchainKHR swap_{};
+     VkExtent2D extent_{};
+     VkFormat swap_format_{};
+     std::vector<VkImage> swap_images_;
+-    VkSemaphore acquired_{};
+-    VkFence fence_{};
++    std::vector<VkSemaphore> swap_done_;
+     VkBuffer arena_{};
+     VkDeviceMemory arena_mem_{};
+     uint8_t *mapped_{};
+-    VkDeviceSize used_ = 0;
+-    static constexpr VkDeviceSize kArena = 128ull << 20;
+     VkDeviceSize alignment_ = 256;
+     VkDescriptorSetLayout descriptors_{};
+-    VkDescriptorPool descriptor_pool_{};
+     VkPipelineLayout pipeline_layout_{};
+     std::map<uint64_t, std::unique_ptr<Image>> targets_, textures_;
+-    std::unique_ptr<Image> white_;
+-    std::vector<std::unique_ptr<Image>> transient_;
++    std::unique_ptr<Image> white_, gamma_lut_, gamma_out_;
++    VkSampler gamma_sampler_{};
++    VkShaderModule gamma_vs_{}, gamma_ps_{};
++    VkPipeline gamma_pipe_{};
++    bool gamma_dirty_ = false;
+     std::map<uint64_t, VkSampler> samplers_;
+     std::map<uint64_t, VkShaderModule> shaders_;
+     std::map<std::vector<uint64_t>, VkPipeline> pipelines_;
+     std::map<uint32_t, VkRenderPass> passes_;
+     std::map<std::pair<VkImageView, VkImageView>, VkFramebuffer> framebuffers_;
+     VkQueryPool queries_{};
+-    uint32_t query_next_ = 0, report_first_ = 0;
      uint64_t query_sum_ = 0, frame_ = 0, draws_ = 0;
++    std::chrono::steady_clock::time_point log_time_{std::chrono::steady_clock::now()};
      uint8_t gamma_[768]{};
      bool gamma_identity_ = true;
 +    bool bc_supported_ = true;
++    bool rendering_ = false;
++    Image *rend_color_ = nullptr, *rend_depth_ = nullptr;
 +#ifdef __ANDROID__
 +    uint32_t surface_epoch_ = 0;
 +    bool surface_lost_ = false;
 +    bool RecreateSurface();
 +#endif
++    FrameSlot &CurrentSlot() { return slots_[slot_]; }
++    VkCommandBuffer Cmd() { return slots_[slot_].cmd; }
++    uint32_t QueryBase() const { return slot_ * 4096; }
      uint32_t MemoryType(uint32_t allowed, VkMemoryPropertyFlags flags);
      void Begin();
-     void Submit(VkSemaphore wait = VK_NULL_HANDLE);
-@@ -308,13 +320,19 @@
+-    void Submit(VkSemaphore wait = VK_NULL_HANDLE);
++    void EndRender();
++    void BeginRender(Image *rt, Image *ds);
++    void WaitSlot(FrameSlot &f, uint32_t slot_index);
++    void Submit(bool sync = true, VkSemaphore wait = VK_NULL_HANDLE, VkSemaphore signal = VK_NULL_HANDLE);
++    void Drain();
+     VkDeviceSize Upload(const void *, size_t, size_t alignment = 16);
+     std::unique_ptr<Image> MakeImage(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, VkFormat, bool, bool);
+     void DestroyImage(Image &);
+     void Layout(Image &, VkImageLayout);
+-    void UploadImage(Image &, const TextureDesc &);
++    void UploadImage(Image &, const TextureDesc &, const uint32_t *colors = nullptr);
+     void UploadDepth(Image &, const TextureDesc &);
++    bool EnsureGammaResources(uint32_t w, uint32_t h);
+     Image *Target(const Surface &, bool);
+     Image *Texture(uint32_t, uint32_t);
+     VkSampler Sampler(const State &, int, bool);
+@@ -241,15 +297,16 @@
+         LOG_FIRST(1, "vulkan: synchronous development readback for NOOVERWRITE");
+         Sync(d, 0);
+     }
+-    void Flush() override { Submit(); }
++    void Flush() override { Drain(); }
+     uint32_t Fence() override {
+-        Submit();
++        Drain();
+         return Backend::Fence();
+     }
+-    void WaitResource(uint32_t) override { Submit(); }
++    void WaitResource(uint32_t) override { Drain(); }
+     void SetGamma(const uint8_t *r) override;
+     void ClearReport() override {
+-        report_first_ = query_next_;
++        FrameSlot &f = CurrentSlot();
++        f.report_first = f.query_next;
+         query_sum_ = 0;
+     }
+     void GetReport(uint32_t) override;
+@@ -308,14 +365,19 @@
      vkGetPhysicalDeviceMemoryProperties(physical_, &memory_);
      VkPhysicalDeviceFeatures features{};
      vkGetPhysicalDeviceFeatures(physical_, &features);
@@ -83,17 +231,296 @@
      enable.independentBlend = features.independentBlend;
      enable.fillModeNonSolid = features.fillModeNonSolid;
      enable.occlusionQueryPrecise = features.occlusionQueryPrecise;
+-    float priority = 1;
 +#ifdef __ANDROID__
 +    vkshader::Init(app::CacheDir() / "shader-cache-vulkan");
 +    surface_epoch_ = host::SurfaceEpoch();
 +#endif
-     float priority = 1;
      VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
      qi.queueFamilyIndex = family_;
-@@ -525,8 +543,68 @@
-                          nullptr, 1, &b);
+     qi.queueCount = 1;
+@@ -329,19 +391,6 @@
+     di.pEnabledFeatures = &enable;
+     Check(vkCreateDevice(physical_, &di, nullptr, &device_), "create device");
+     vkGetDeviceQueue(device_, family_, 0, &queue_);
+-    VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+-    pi.queueFamilyIndex = family_;
+-    pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+-    Check(vkCreateCommandPool(device_, &pi, nullptr, &pool_), "command pool");
+-    VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+-    ca.commandPool = pool_;
+-    ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+-    ca.commandBufferCount = 1;
+-    Check(vkAllocateCommandBuffers(device_, &ca, &cmd_), "command buffer");
+-    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+-    Check(vkCreateFence(device_, &fi, nullptr, &fence_), "fence");
+-    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+-    Check(vkCreateSemaphore(device_, &si, nullptr, &acquired_), "semaphore");
+     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+     bi.size = kArena;
+     bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+@@ -379,11 +428,28 @@
+     VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768},
+                                     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 65536},
+                                     {VK_DESCRIPTOR_TYPE_SAMPLER, 65536}};
+-    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+-    dpi.maxSets = 16384;
+-    dpi.poolSizeCount = 3;
+-    dpi.pPoolSizes = sizes;
+-    Check(vkCreateDescriptorPool(device_, &dpi, nullptr, &descriptor_pool_), "descriptor pool");
++    for (uint32_t i = 0; i < kFrames; i++) {
++        FrameSlot &f = slots_[i];
++        f.base = kFrameArena * i;
++        VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++        pi.queueFamilyIndex = family_;
++        pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++        Check(vkCreateCommandPool(device_, &pi, nullptr, &f.pool), "command pool");
++        VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++        ca.commandPool = f.pool;
++        ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        ca.commandBufferCount = 1;
++        Check(vkAllocateCommandBuffers(device_, &ca, &f.cmd), "command buffer");
++        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++        Check(vkCreateFence(device_, &fi, nullptr, &f.fence), "fence");
++        VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
++        Check(vkCreateSemaphore(device_, &si, nullptr, &f.acquired), "semaphore");
++        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
++        dpi.maxSets = 16384;
++        dpi.poolSizeCount = 3;
++        dpi.pPoolSizes = sizes;
++        Check(vkCreateDescriptorPool(device_, &dpi, nullptr, &f.descriptor_pool), "descriptor pool");
++    }
+     VkQueryPoolCreateInfo qp{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+     qp.queryType = VK_QUERY_TYPE_OCCLUSION;
+     qp.queryCount = 8192;
+@@ -397,62 +463,127 @@
+     cp.bufferOffset = off;
+     cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+     cp.imageExtent = {1, 1, 1};
+-    vkCmdCopyBufferToImage(cmd_, arena_, white_->image, white_->layout, 1, &cp);
++    vkCmdCopyBufferToImage(Cmd(), arena_, white_->image, white_->layout, 1, &cp);
+     Layout(*white_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+     LOGR("vulkan: %s, guest %ux%u; experimental native-resolution renderer", prop.deviceName, w, h);
+     LOGR("vulkan: HD texture replacements and settings menu are not implemented in this development backend");
+     Resize();
+     return true;
+ }
++void Vulkan::WaitSlot(FrameSlot &f, uint32_t slot_index) {
++    if (!f.submitted)
++        return;
++    Check(vkWaitForFences(device_, 1, &f.fence, VK_TRUE, 30000000000ull), "GPU wait");
++    if (f.query_next > f.report_first) {
++        std::vector<uint64_t> results(f.query_next - f.report_first);
++        Check(vkGetQueryPoolResults(device_, queries_, slot_index * 4096 + f.report_first, uint32_t(results.size()),
++                                    results.size() * 8, results.data(), 8,
++                                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
++              "occlusion results");
++        for (auto n : results)
++            query_sum_ += n;
++    }
++    f.query_next = f.report_first = 0;
++    f.used = 0;
++    for (auto &image : f.retire)
++        DestroyImage(*image);
++    f.retire.clear();
++    Check(vkResetDescriptorPool(device_, f.descriptor_pool, 0), "reset descriptors");
++    Check(vkResetCommandPool(device_, f.pool, 0), "reset command pool");
++    f.submitted = false;
++}
+ void Vulkan::Begin() {
+-    if (recording_)
++    FrameSlot &f = CurrentSlot();
++    if (f.recording)
+         return;
+-    Check(vkResetCommandBuffer(cmd_, 0), "reset command buffer");
++    WaitSlot(f, slot_);
+     VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+     b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+-    Check(vkBeginCommandBuffer(cmd_, &b), "begin command buffer");
+-    recording_ = true;
++    Check(vkBeginCommandBuffer(f.cmd, &b), "begin command buffer");
++    vkCmdResetQueryPool(f.cmd, queries_, QueryBase(), 4096);
++    f.recording = true;
+ }
+-void Vulkan::Submit(VkSemaphore wait) {
+-    if (!recording_)
++void Vulkan::EndRender() {
++    if (!rendering_)
+         return;
+-    Check(vkEndCommandBuffer(cmd_), "end command buffer");
+-    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
++    vkCmdEndRenderPass(Cmd());
++    rendering_ = false;
++    rend_color_ = rend_depth_ = nullptr;
++}
++void Vulkan::BeginRender(Image *rt, Image *ds) {
++    Begin();
++    if (rendering_ && rend_color_ == rt && rend_depth_ == ds)
++        return;
++    EndRender();
++    if (rt)
++        Layout(*rt, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    if (ds)
++        Layout(*ds, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
++    uint32_t fw = rt ? rt->w : ds->w, fh = rt ? rt->h : ds->h;
++    if (rt && ds) {
++        fw = std::min(fw, ds->w);
++        fh = std::min(fh, ds->h);
++    }
++    auto pass = Pass(rt != nullptr, ds != nullptr);
++    VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
++    begin.renderPass = pass;
++    begin.framebuffer = Framebuffer(rt, ds, pass);
++    begin.renderArea.extent = {fw, fh};
++    vkCmdBeginRenderPass(Cmd(), &begin, VK_SUBPASS_CONTENTS_INLINE);
++    rendering_ = true;
++    rend_color_ = rt;
++    rend_depth_ = ds;
++}
++void Vulkan::Submit(bool sync, VkSemaphore wait, VkSemaphore signal) {
++    EndRender();
++    FrameSlot &f = CurrentSlot();
++    if (!f.recording) {
++        if (sync)
++            WaitSlot(f, slot_);
++        return;
++    }
++    Check(vkEndCommandBuffer(f.cmd), "end command buffer");
++    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+     VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+     s.commandBufferCount = 1;
+-    s.pCommandBuffers = &cmd_;
++    s.pCommandBuffers = &f.cmd;
+     if (wait) {
+         s.waitSemaphoreCount = 1;
+         s.pWaitSemaphores = &wait;
+         s.pWaitDstStageMask = &stage;
+     }
+-    Check(vkResetFences(device_, 1, &fence_), "reset fence");
+-    Check(vkQueueSubmit(queue_, 1, &s, fence_), "submit");
+-    Check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, 30000000000ull), "GPU wait");
+-    if (query_next_ > report_first_) {
+-        std::vector<uint64_t> results(query_next_ - report_first_);
+-        Check(vkGetQueryPoolResults(device_, queries_, report_first_, uint32_t(results.size()), results.size() * 8,
+-                                    results.data(), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+-              "occlusion results");
+-        for (auto n : results)
+-            query_sum_ += n;
+-    }
+-    query_next_ = report_first_ = 0;
+-    recording_ = false;
+-    used_ = 0;
+-    for (auto &image : transient_)
+-        DestroyImage(*image);
+-    transient_.clear();
+-    Check(vkResetDescriptorPool(device_, descriptor_pool_, 0), "reset descriptors");
++    if (signal) {
++        s.signalSemaphoreCount = 1;
++        s.pSignalSemaphores = &signal;
++    }
++    Check(vkResetFences(device_, 1, &f.fence), "reset fence");
++    Check(vkQueueSubmit(queue_, 1, &s, f.fence), "submit");
++    f.recording = false;
++    f.submitted = true;
++    if (sync)
++        WaitSlot(f, slot_);
++}
++void Vulkan::Drain() {
++    EndRender();
++    uint32_t other = (slot_ + 1) % kFrames;
++    WaitSlot(slots_[other], other);
++    Submit(true);
+ }
+ VkDeviceSize Vulkan::Upload(const void *data, size_t n, size_t alignment) {
+-    VkDeviceSize off = (used_ + alignment - 1) & ~VkDeviceSize(alignment - 1);
+-    if (off + n > kArena)
+-        Fail("upload arena exhausted; frame exceeds 128 MiB");
+-    if (data)
+-        std::memcpy(mapped_ + off, data, n);
+-    used_ = off + n;
+-    return off;
++    Begin();
++    FrameSlot &f = CurrentSlot();
++    if (n > kFrameArena)
++        Fail("upload exceeds 64 MiB frame slot");
++    VkDeviceSize off = (f.used + alignment - 1) & ~VkDeviceSize(alignment - 1);
++    if (off + n > kFrameArena) {
++        Submit(true);
++        Begin();
++        off = 0;
++    }
++    if (data && n)
++        std::memcpy(mapped_ + f.base + off, data, n);
++    f.used = off + n;
++    return f.base + off;
+ }
+ std::unique_ptr<Image> Vulkan::MakeImage(uint32_t w, uint32_t h, uint32_t depth, uint32_t levels, uint32_t layers,
+                                          VkFormat format, bool z, bool target) {
+@@ -509,39 +640,142 @@
+     vkDestroyImage(device_, t.image, nullptr);
+     vkFreeMemory(device_, t.memory, nullptr);
+ }
++void StageAccessForLayout(VkImageLayout layout, VkPipelineStageFlags &stage, VkAccessFlags &access) {
++    switch (layout) {
++    case VK_IMAGE_LAYOUT_UNDEFINED:
++        stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
++        access = 0;
++        break;
++    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
++        stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
++        access = VK_ACCESS_TRANSFER_WRITE_BIT;
++        break;
++    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
++        stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
++        access = VK_ACCESS_TRANSFER_READ_BIT;
++        break;
++    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
++        stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++        access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++        break;
++    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
++        stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
++        access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++        break;
++    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
++    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
++        stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
++        access = VK_ACCESS_SHADER_READ_BIT;
++        break;
++    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
++        stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
++        access = 0;
++        break;
++    default:
++        stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++        access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++        break;
++    }
++}
+ void Vulkan::Layout(Image &t, VkImageLayout layout) {
+     Begin();
+-    // Include a memory dependency even when layout stays unchanged (successive render passes).
++    if (t.layout == layout)
++        return;
++    EndRender();
++    VkPipelineStageFlags src_stage = 0, dst_stage = 0;
+     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+-    b.srcAccessMask =
+-        t.layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+-    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++    StageAccessForLayout(t.layout, src_stage, b.srcAccessMask);
++    StageAccessForLayout(layout, dst_stage, b.dstAccessMask);
+     b.oldLayout = t.layout;
+     b.newLayout = layout;
+     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+     b.image = t.image;
+     b.subresourceRange = {Aspects(t.z), 0, t.levels, 0, t.layers};
+-    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+-                         nullptr, 1, &b);
++    vkCmdPipelineBarrier(Cmd(), src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
      t.layout = layout;
  }
+-void Vulkan::UploadImage(Image &image, const TextureDesc &d) {
 +void Rgb565(uint16_t c, uint8_t *bgr) {
 +    bgr[2] = uint8_t((c >> 11) * 255 / 31);
 +    bgr[1] = uint8_t(((c >> 5) & 63) * 255 / 63);
@@ -152,15 +579,17 @@
 +                        std::memcpy(&out[((size_t(s) * h + by * 4 + y) * w + bx * 4 + x) * 4], px + (y * 4 + x) * 4, 4);
 +            }
 +}
- void Vulkan::UploadImage(Image &image, const TextureDesc &d) {
++void Vulkan::UploadImage(Image &image, const TextureDesc &d, const uint32_t *colors) {
      const uint8_t *guest = static_cast<const uint8_t *>(kernel::HostPtr(d.data));
 +    const Host host_fmt = Format(d.format).host;
 +    const bool decode_dxt = !bc_supported_ && (host_fmt == Host::BC1 || host_fmt == Host::BC2 || host_fmt == Host::BC3);
      Layout(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
      for (uint32_t face = 0; face < image.layers; face++)
          for (uint32_t level = 0; level < d.levels; level++) {
-@@ -535,12 +613,17 @@
-             DecodeLevel(d, level, face, guest, nullptr, pixels, pitch);
+             std::vector<uint8_t> pixels;
+             uint32_t pitch = 0;
+-            DecodeLevel(d, level, face, guest, nullptr, pixels, pitch);
++            DecodeLevel(d, level, face, guest, colors, pixels, pitch);
              if (pixels.empty())
                  Fail("texture decode failed");
 -            auto off = Upload(pixels.data(), pixels.size(), 16);
@@ -176,27 +605,181 @@
              c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, face, 1};
 -            c.imageExtent = {std::max(d.width >> level, 1u), std::max(d.height >> level, 1u),
 -                             std::max(d.depth >> level, 1u)};
+-            vkCmdCopyBufferToImage(cmd_, arena_, image.image, image.layout, 1, &c);
 +            c.imageExtent = {lw, lh, lz};
-             vkCmdCopyBufferToImage(cmd_, arena_, image.image, image.layout, 1, &c);
++            vkCmdCopyBufferToImage(Cmd(), arena_, image.image, image.layout, 1, &c);
          }
      Layout(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-@@ -662,8 +745,14 @@
+ }
+@@ -587,11 +821,11 @@
+     copy.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+     copy.imageExtent = {d.width, d.height, 1};
+     copy.bufferOffset = Upload(depth.data(), depth.size() * 4);
+-    vkCmdCopyBufferToImage(cmd_, arena_, image.image, image.layout, 1, &copy);
++    vkCmdCopyBufferToImage(Cmd(), arena_, image.image, image.layout, 1, &copy);
+     copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+     copy.bufferOffset = Upload(stencil.data(), stencil.size());
+-    vkCmdCopyBufferToImage(cmd_, arena_, image.image, image.layout, 1, &copy);
+-    image.signature = Hash(guest, TotalSize(d));
++    vkCmdCopyBufferToImage(Cmd(), arena_, image.image, image.layout, 1, &copy);
++    image.signature = MemSig(d.data, TotalSize(d));
+     image.epoch = DirtyEpoch(d.data);
+     image.drawn = true;
+     LOG_FIRST(4, "vulkan: CPU depth imported %08X, %ux%u", d.data, d.width, d.height);
+@@ -605,8 +839,8 @@
+     uint64_t key = uint64_t(d.data) << 1 | uint64_t(z);
+     auto &p = targets_[key];
+     if (p && (p->w != d.width || p->h != d.height)) {
+-        Submit();
+-        for (auto [key, fb] : framebuffers_)
++        Drain();
++        for (auto [fb_key, fb] : framebuffers_)
+             vkDestroyFramebuffer(device_, fb, nullptr);
+         framebuffers_.clear();
+         DestroyImage(*p);
+@@ -615,25 +849,32 @@
+     if (!p) {
+         p = MakeImage(d.width, d.height, 1, 1, 1, z ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_B8G8R8A8_UNORM, z, true);
+         p->desc = d;
++        Layout(*p, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+         if (z) {
+-            Layout(*p, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+             VkClearDepthStencilValue v{1, 0};
+             VkImageSubresourceRange r{VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+-            vkCmdClearDepthStencilImage(cmd_, p->image, p->layout, &v, 1, &r);
+-            p->signature = Hash(kernel::HostPtr(d.data), TotalSize(d));
+-            p->epoch = DirtyEpoch(d.data);
++            vkCmdClearDepthStencilImage(Cmd(), p->image, p->layout, &v, 1, &r);
++        } else {
++            VkClearColorValue black{};
++            VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++            vkCmdClearColorImage(Cmd(), p->image, p->layout, &black, 1, &r);
+         }
++        p->signature = MemSig(d.data, TotalSize(d));
++        p->epoch = DirtyEpoch(d.data);
+     }
+     p->used = frame_;
+-    if (z && p->signature != Hash(kernel::HostPtr(d.data), TotalSize(d)))
+-        UploadDepth(*p, d);
+-    if (!z) {
+-        uint64_t sig = Hash(kernel::HostPtr(d.data), TotalSize(d));
+-        if (sig != p->signature || p->epoch == ~0ull) {
+-            UploadImage(*p, d);
+-            p->signature = sig;
+-            p->epoch = DirtyEpoch(d.data);
+-            p->drawn = false;
++    uint64_t ep = DirtyEpoch(d.data);
++    if (ep != p->epoch) {
++        uint64_t sig = MemSig(d.data, TotalSize(d));
++        p->epoch = ep;
++        if (sig != p->signature) {
++            if (z) {
++                UploadDepth(*p, d);
++            } else {
++                UploadImage(*p, d);
++                p->signature = sig;
++                p->drawn = false;
++            }
+         }
+     }
+     return p.get();
+@@ -644,44 +885,65 @@
+     TextureDesc d;
+     if (!Describe(header, d))
+         Fail("invalid texture");
+-    auto it = targets_.find(uint64_t(d.data) << 1 | uint64_t(Format(d.format).depth));
+-    if (it != targets_.end() && it->second->w == d.width && it->second->h == d.height) {
+-        it->second->used = frame_;
+-        return it->second.get();
++    const FormatInfo &fi = Format(d.format);
++    if (!d.cube && d.depth == 1 && !fi.compressed) {
++        auto it = targets_.find(uint64_t(d.data) << 1 | uint64_t(fi.depth));
++        if (it != targets_.end() && it->second->w == d.width && it->second->h == d.height) {
++            it->second->used = frame_;
++            return it->second.get();
++        }
+     }
+-    uint64_t signature = Hash(kernel::HostPtr(d.data), TotalSize(d));
+-    uint64_t key = Hash(&d, sizeof(d), signature);
++    // Only paletted 8-bit textures (P8 = 0x0B, swizzled) read a stage palette; later DXT/linear draws may keep an old palette bound.
++    uint32_t colors_buf[256];
+     const uint32_t *colors = nullptr;
+-    if (palette) {
+-        uint32_t va = mem::VirtualFromPhysical(kernel::R32(palette + 4));
+-        colors = static_cast<const uint32_t *>(kernel::HostPtr(va));
+-        key = Hash(colors, 1024, key);
++    uint32_t pal_va = 0;
++    uint64_t pal_hash = 0;
++    if (palette && d.format == 0x0B && !d.linear) {
++        pal_va = mem::VirtualFromPhysical(kernel::R32(palette + 4));
++        uint32_t size_code = kernel::R32(palette) >> 30;
++        size_t bytes = (256u >> std::min(size_code, 8u)) * sizeof(uint32_t);
++        std::memset(colors_buf, 0, sizeof(colors_buf));
++        std::memcpy(colors_buf, kernel::HostPtr(pal_va), bytes);
++        colors = colors_buf;
++        pal_hash = Hash(colors_buf, sizeof(colors_buf));
+     }
++    uint64_t key = (uint64_t(pal_va) << 32) | d.data;
+     auto &p = textures_[key];
+-    if (p) {
++    bool same = p && SameTextureDesc(p->desc, d);
++    uint64_t ep = DirtyEpoch(d.data);
++    if (same && p->checked_frame == frame_ + 1 && p->palette_hash == pal_hash && ep == p->epoch) {
          p->used = frame_;
          return p.get();
      }
 -    p = MakeImage(d.width, d.height, d.depth, d.levels, d.cube ? 6 : 1, FormatOf(Format(d.format).host), false, false);
-+    p = MakeImage(d.width, d.height, d.depth, d.levels, d.cube ? 6 : 1, FormatOf(Format(d.format).host, bc_supported_), false, false);
-     p->desc = d;
+-    p->desc = d;
+-    if (!colors)
+-        UploadImage(*p, d);
+-    else {
+-        Layout(*p, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+-        for (uint32_t face = 0; face < p->layers; face++)
+-            for (uint32_t level = 0; level < d.levels; level++) {
+-                std::vector<uint8_t> px;
+-                uint32_t pitch;
+-                DecodeLevel(d, level, face, static_cast<const uint8_t *>(kernel::HostPtr(d.data)), colors, px, pitch);
+-                VkBufferImageCopy c{};
+-                c.bufferOffset = Upload(px.data(), px.size(), 16);
+-                c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, face, 1};
+-                c.imageExtent = {std::max(d.width >> level, 1u), std::max(d.height >> level, 1u),
+-                                 std::max(d.depth >> level, 1u)};
+-                vkCmdCopyBufferToImage(cmd_, arena_, p->image, p->layout, 1, &c);
+-            }
+-        Layout(*p, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    uint64_t sig = MemSig(d.data, TotalSize(d)) ^ ep ^ pal_hash;
++    if (same && sig == p->signature) {
++        p->checked_frame = frame_ + 1;
++        p->palette_hash = pal_hash;
++        p->epoch = ep;
++        p->used = frame_;
++        return p.get();
++    }
++    if (p) {
++        if (frame_ - p->used < kFrames)
++            CurrentSlot().retire.push_back(std::move(p));
++        else
++            DestroyImage(*p);
++        p.reset();
++    }
++    p = MakeImage(d.width, d.height, d.depth, d.levels, d.cube ? 6 : 1, FormatOf(fi.host, bc_supported_), false, false);
++    p->desc = d;
 +    if (static int tex_logged = 0; tex_logged < 24) {
 +        tex_logged++;
 +        LOGR("vulkan: tex#%d fmt=0x%02X (%s) %ux%u lin=%d pal=%d comp=%d pitch=%u data=0x%08X",
-+             tex_logged, d.format, Format(d.format).name, d.width, d.height, int(d.linear),
-+             int(colors != nullptr), int(Format(d.format).compressed), d.pitch, d.data);
++             tex_logged, d.format, fi.name, d.width, d.height, int(d.linear),
++             int(colors != nullptr), int(fi.compressed), d.pitch, d.data);
 +    }
-     if (!colors)
-         UploadImage(*p, d);
-     else {
-@@ -813,6 +902,11 @@
++    UploadImage(*p, d, colors);
++    p->signature = sig;
++    p->epoch = ep;
++    p->palette_hash = pal_hash;
++    p->checked_frame = frame_ + 1;
++    p->used = frame_;
+     return p.get();
+ }
+ VkSampler Vulkan::Sampler(const State &s, int stage, bool shadow) {
+@@ -813,6 +1075,11 @@
      auto it = shaders_.find(key);
      if (it != shaders_.end())
          return it->second;
@@ -208,7 +791,7 @@
      auto dir = app::CacheDir() / "shader-cache-vulkan";
      std::filesystem::create_directories(dir);
      std::string name = std::to_string(key);
-@@ -876,11 +970,12 @@
+@@ -876,11 +1143,12 @@
      auto size = f.tellg();
      if (size <= 0 || size % 4)
          Fail("invalid SPIR-V file");
@@ -222,14 +805,389 @@
      VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
      ci.codeSize = words.size() * 4;
      ci.pCode = words.data();
-@@ -1439,16 +1534,55 @@
+@@ -1121,9 +1389,11 @@
+         return;
+     if (a.buffer_count != 1 || a.decode)
+         Fail("Linux requires converted float4 vertex assembly");
+-    if (used_ > kArena - (16ull << 20) || query_next_ >= 8192)
+-        Submit();
+     Begin();
++    if (CurrentSlot().used > kFrameArena - (16ull << 20) || CurrentSlot().query_next >= 4096) {
++        Submit(true);
++        Begin();
++    }
+     Image *rt = Target(s.rt, false);
+     Image *ds = Target(s.zs, true);
+     if (!rt && !ds)
+@@ -1133,7 +1403,8 @@
+     for (int i = 0; i < 4; i++) {
+         images[size_t(i)] = Texture(s.textures[size_t(i)], s.palettes[size_t(i)]);
+         auto *t = images[size_t(i)];
+-        bool target = targets_.contains(uint64_t(t->desc.data) << 1 | uint64_t(t->z));
++        auto tit = targets_.find(uint64_t(t->desc.data) << 1 | uint64_t(t->z));
++        bool target = (tit != targets_.end() && tit->second.get() == t);
+         if (s.textures[size_t(i)]) {
+             info[i].kind = t->layers == 6 ? kTexCube : t->depth > 1 ? kTex3D : kTex2D;
+             info[i].rect = t->desc.linear ? 1 : 0;
+@@ -1144,13 +1415,14 @@
+             auto snapshot = MakeImage(t->w, t->h, 1, 1, 1, t->format, t->z, false);
+             Layout(*t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+             Layout(*snapshot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++            EndRender();
+             VkImageCopy copy{};
+             copy.srcSubresource =
+                 copy.dstSubresource = {t->z ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+             copy.extent = {t->w, t->h, 1};
+-            vkCmdCopyImage(cmd_, t->image, t->layout, snapshot->image, snapshot->layout, 1, &copy);
++            vkCmdCopyImage(Cmd(), t->image, t->layout, snapshot->image, snapshot->layout, 1, &copy);
+             images[size_t(i)] = snapshot.get();
+-            transient_.push_back(std::move(snapshot));
++            CurrentSlot().retire.push_back(std::move(snapshot));
+             t = images[size_t(i)];
+         }
+         Layout(*t, t->z ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+@@ -1173,7 +1445,7 @@
+         {arena_, Upload(s.vsc.data(), sizeof(s.vsc), size_t(alignment_)), sizeof(s.vsc)},
+         {arena_, Upload(&dc, sizeof(dc), size_t(alignment_)), sizeof(dc)}};
+     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+-    ai.descriptorPool = descriptor_pool_;
++    ai.descriptorPool = CurrentSlot().descriptor_pool;
+     ai.descriptorSetCount = 1;
+     ai.pSetLayouts = &descriptors_;
+     VkDescriptorSet set;
+@@ -1204,25 +1476,16 @@
+     VkDeviceSize ib = 0;
+     if (a.index_count)
+         ib = Upload(a.index_src, size_t(a.index_count) * (a.index16 ? 2 : 4));
+-    if (rt)
+-        Layout(*rt, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+-    if (ds)
+-        Layout(*ds, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+     uint32_t fw = ds ? std::min(w, ds->w) : w, fh = ds ? std::min(h, ds->h) : h;
+     uint32_t q = ~0u;
+-    if (SS(s, kMCountEnable)) {
+-        q = query_next_++;
+-        vkCmdResetQueryPool(cmd_, queries_, q, 1);
+-    }
+-    VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+-    begin.renderPass = pass;
+-    begin.framebuffer = Framebuffer(rt, ds, pass);
+-    begin.renderArea.extent = {fw, fh};
+-    vkCmdBeginRenderPass(cmd_, &begin, VK_SUBPASS_CONTENTS_INLINE);
+-    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+-    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
++    if (SS(s, kMCountEnable))
++        q = QueryBase() + CurrentSlot().query_next++;
++    BeginRender(rt, ds);
++    VkCommandBuffer cb = Cmd();
++    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
++    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
+     VkViewport viewport{0, 0, float(w), float(h), 0, 1};
+-    vkCmdSetViewport(cmd_, 0, 1, &viewport);
++    vkCmdSetViewport(cb, 0, 1, &viewport);
+     VkRect2D sc{{0, 0}, {fw, fh}};
+     if (s.scissor_count) {
+         if (s.scissor_count > 1)
+@@ -1238,22 +1501,21 @@
+     int y1 = std::min(sc.offset.y + int(sc.extent.height),
+                       int(std::min(uint64_t(s.viewport.y) + s.viewport.h, uint64_t(fh))));
+     sc = {{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
+-    vkCmdSetScissor(cmd_, 0, 1, &sc);
++    vkCmdSetScissor(cb, 0, 1, &sc);
+     float blend[4];
+     Color(SS(s, kMBlendColor), blend);
+-    vkCmdSetBlendConstants(cmd_, blend);
+-    vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, SS(s, kMStencilRef) & 255);
+-    vkCmdBindVertexBuffers(cmd_, 0, 1, &arena_, &vb);
++    vkCmdSetBlendConstants(cb, blend);
++    vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, SS(s, kMStencilRef) & 255);
++    vkCmdBindVertexBuffers(cb, 0, 1, &arena_, &vb);
+     if (q != ~0u)
+-        vkCmdBeginQuery(cmd_, queries_, q, 0);
++        vkCmdBeginQuery(cb, queries_, q, 0);
+     if (a.index_count) {
+-        vkCmdBindIndexBuffer(cmd_, arena_, ib, a.index16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+-        vkCmdDrawIndexed(cmd_, a.index_count, 1, 0, a.base_vertex, 0);
++        vkCmdBindIndexBuffer(cb, arena_, ib, a.index16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
++        vkCmdDrawIndexed(cb, a.index_count, 1, 0, a.base_vertex, 0);
+     } else
+-        vkCmdDraw(cmd_, a.draw_count, 1, 0, 0);
++        vkCmdDraw(cb, a.draw_count, 1, 0, 0);
+     if (q != ~0u)
+-        vkCmdEndQuery(cmd_, queries_, q);
+-    vkCmdEndRenderPass(cmd_);
++        vkCmdEndQuery(cb, queries_, q);
+     if (rt)
+         rt->drawn = true;
+     if (ds)
+@@ -1271,12 +1533,13 @@
+         return;
+     Begin();
+     if (!count) {
++        EndRender();
+         if (rt) {
+             Layout(*rt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+             VkClearColorValue c;
+             Color(color, c.float32);
+             VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+-            vkCmdClearColorImage(cmd_, rt->image, rt->layout, &c, 1, &r);
++            vkCmdClearColorImage(Cmd(), rt->image, rt->layout, &c, 1, &r);
+             rt->drawn = true;
+         }
+         if (ds) {
+@@ -1285,26 +1548,17 @@
+             VkImageAspectFlags aspects = ((flags & kClearZ) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
+                                          ((flags & kClearStencil) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+             VkImageSubresourceRange r{aspects, 0, 1, 0, 1};
+-            vkCmdClearDepthStencilImage(cmd_, ds->image, ds->layout, &c, 1, &r);
++            vkCmdClearDepthStencilImage(Cmd(), ds->image, ds->layout, &c, 1, &r);
+             ds->drawn = true;
+         }
+         return;
+     }
+-    if (rt)
+-        Layout(*rt, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+-    if (ds)
+-        Layout(*ds, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+     uint32_t w = rt ? rt->w : ds->w, h = rt ? rt->h : ds->h;
+-    if (ds) {
++    if (rt && ds) {
+         w = std::min(w, ds->w);
+         h = std::min(h, ds->h);
+     }
+-    auto pass = Pass(rt != nullptr, ds != nullptr);
+-    VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+-    bi.renderPass = pass;
+-    bi.framebuffer = Framebuffer(rt, ds, pass);
+-    bi.renderArea.extent = {w, h};
+-    vkCmdBeginRenderPass(cmd_, &bi, VK_SUBPASS_CONTENTS_INLINE);
++    BeginRender(rt, ds);
+     VkClearAttachment attachments[2]{};
+     uint32_t n = 0;
+     if (rt) {
+@@ -1327,10 +1581,9 @@
+         int x1 = std::clamp(r[2], x0, int(w)), y1 = std::clamp(r[3], y0, int(h));
+         if (x1 > x0 && y1 > y0) {
+             VkClearRect cr{{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, 0, 1};
+-            vkCmdClearAttachments(cmd_, n, attachments, 1, &cr);
++            vkCmdClearAttachments(Cmd(), n, attachments, 1, &cr);
+         }
+     }
+-    vkCmdEndRenderPass(cmd_);
+ }
+ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32_t rects, uint32_t points) {
+     LOG_FIRST(12, "vulkan: CopyRects src=%08X dst=%08X count=%u rects=%08X points=%08X", src.data, dst.data, count,
+@@ -1350,8 +1603,15 @@
+             Fail("unsupported CPU CopyRects format");
+         if (bz)
+             UploadDepth(*Target(dst, true), b);
+-        else if (targets_.contains(uint64_t(b.data) << 1))
+-            Target(dst, false);
++        else if (targets_.contains(uint64_t(b.data) << 1)) {
++            Image *dt = Target(dst, false);
++            if (dt) {
++                UploadImage(*dt, b);
++                dt->signature = MemSig(b.data, TotalSize(b));
++                dt->epoch = DirtyEpoch(b.data);
++                dt->drawn = false;
++            }
++        }
+         return;
+     }
+     Image *from = Target(src, az);
+@@ -1362,6 +1622,7 @@
+         Fail("overlapping CopyRects requires an intermediate image");
+     Layout(*from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+     Layout(*to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    EndRender();
+     uint32_t copies = count && rects ? count : 1;
+     for (uint32_t i = 0; i < copies; i++) {
+         int32_t r[4] = {0, 0, int32_t(std::min(from->w, to->w)), int32_t(std::min(from->h, to->h))}, p[2] = {0, 0};
+@@ -1382,10 +1643,10 @@
+         c.srcOffset = {r[0], r[1], 0};
+         c.dstOffset = {p[0], p[1], 0};
+         c.extent = {uint32_t(r[2] - r[0]), uint32_t(r[3] - r[1]), 1};
+-        vkCmdCopyImage(cmd_, from->image, from->layout, to->image, to->layout, 1, &c);
++        vkCmdCopyImage(Cmd(), from->image, from->layout, to->image, to->layout, 1, &c);
+         if (az) {
+             c.srcSubresource.aspectMask = c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+-            vkCmdCopyImage(cmd_, from->image, from->layout, to->image, to->layout, 1, &c);
++            vkCmdCopyImage(Cmd(), from->image, from->layout, to->image, to->layout, 1, &c);
+         }
+     }
+     to->drawn = true;
+@@ -1394,19 +1655,20 @@
+     if (t.z)
+         Fail("CPU depth readback not yet implemented");
+     Layout(t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    EndRender();
+     size_t bytes = size_t(t.w) * t.h * 4;
+     auto off = Upload(nullptr, bytes, 16);
+     VkBufferImageCopy c{};
+     c.bufferOffset = off;
+     c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+     c.imageExtent = {t.w, t.h, 1};
+-    vkCmdCopyImageToBuffer(cmd_, t.image, t.layout, arena_, 1, &c);
++    vkCmdCopyImageToBuffer(Cmd(), t.image, t.layout, arena_, 1, &c);
+     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+     barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+-    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr,
++    vkCmdPipelineBarrier(Cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr,
+                          0, nullptr);
+-    Submit();
++    Drain();
+     out.assign(mapped_ + off, mapped_ + off + bytes);
+ }
+ void Vulkan::Sync(uint32_t data, uint32_t) {
+@@ -1421,11 +1683,12 @@
+     auto *guest = static_cast<uint8_t *>(kernel::HostPtr(data));
+     for (uint32_t y = 0; y < t.h; y++)
+         std::memcpy(guest + size_t(y) * t.desc.pitch, px.data() + size_t(y) * t.w * 4, t.w * 4);
+-    t.signature = Hash(guest, TotalSize(t.desc));
++    t.signature = MemSig(data, TotalSize(t.desc));
++    t.epoch = DirtyEpoch(data);
+     t.drawn = false;
+ }
+ void Vulkan::GetReport(uint32_t va) {
+-    Submit();
++    Drain();
+     kernel::W32(va, uint32_t(frame_));
+     kernel::W32(va + 4, 0);
+     kernel::W32(va + 8, uint32_t(std::min<uint64_t>(query_sum_, 0xffffffffu)));
+@@ -1438,17 +1701,180 @@
+     for (int c = 0; c < 3; c++)
          for (int i = 0; i < 256; i++)
              gamma_identity_ &= ramp[c * 256 + i] == i;
++    gamma_dirty_ = !gamma_identity_;
  }
++bool Vulkan::EnsureGammaResources(uint32_t w, uint32_t h) {
++    if (!gamma_sampler_) {
++        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
++        sci.magFilter = VK_FILTER_NEAREST;
++        sci.minFilter = VK_FILTER_NEAREST;
++        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++        Check(vkCreateSampler(device_, &sci, nullptr, &gamma_sampler_), "gamma sampler");
++    }
++    if (!gamma_lut_)
++        gamma_lut_ = MakeImage(256, 1, 1, 1, 1, VK_FORMAT_B8G8R8A8_UNORM, false, false);
++    if (gamma_dirty_) {
++        uint8_t lut[256 * 4];
++        for (int i = 0; i < 256; i++) {
++            lut[i * 4 + 0] = gamma_[512 + i];
++            lut[i * 4 + 1] = gamma_[256 + i];
++            lut[i * 4 + 2] = gamma_[i];
++            lut[i * 4 + 3] = 255;
++        }
++        Layout(*gamma_lut_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++        EndRender();
++        VkBufferImageCopy c{};
++        c.bufferOffset = Upload(lut, sizeof(lut), 16);
++        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        c.imageExtent = {256, 1, 1};
++        vkCmdCopyBufferToImage(Cmd(), arena_, gamma_lut_->image, gamma_lut_->layout, 1, &c);
++        Layout(*gamma_lut_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        gamma_dirty_ = false;
++    }
++    if (gamma_out_ && (gamma_out_->w != w || gamma_out_->h != h)) {
++        Drain();
++        for (auto [fb_key, fb] : framebuffers_)
++            vkDestroyFramebuffer(device_, fb, nullptr);
++        framebuffers_.clear();
++        DestroyImage(*gamma_out_);
++        gamma_out_.reset();
++    }
++    if (!gamma_out_)
++        gamma_out_ = MakeImage(w, h, 1, 1, 1, VK_FORMAT_B8G8R8A8_UNORM, false, true);
++    if (!gamma_pipe_) {
++        static const char *kGammaVs = R"(
++struct GammaVOut {
++    float4 pos : SV_Position;
++    float4 tc0 : TEXCOORD0;
++};
++GammaVOut main(uint id : SV_VertexID) {
++    GammaVOut o;
++    float2 p = float2((id << 1) & 2, id & 2);
++    o.tc0 = float4(p, 0, 1);
++    float4 q = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
++    o.pos = q;
++    return o;
++}
++)";
++        static const char *kGammaPs = R"(
++struct GammaVOut {
++    float4 pos : SV_Position;
++    float4 tc0 : TEXCOORD0;
++};
++Texture2D tex0 : register(t0);
++Texture2D tex1 : register(t1);
++SamplerState smp0 : register(s0);
++SamplerState smp1 : register(s1);
++float4 main(GammaVOut i) : SV_Target {
++    float4 c = tex0.Sample(smp0, i.tc0.xy);
++    float r = tex1.Sample(smp1, float2((c.r * 255.0 + 0.5) / 256.0, 0.5)).r;
++    float g = tex1.Sample(smp1, float2((c.g * 255.0 + 0.5) / 256.0, 0.5)).g;
++    float b = tex1.Sample(smp1, float2((c.b * 255.0 + 0.5) / 256.0, 0.5)).b;
++    return float4(r, g, b, 1.0);
++}
++)";
++        uint64_t hvs = 0, hps = 0;
++        gamma_vs_ = Shader(kGammaVs, true, hvs);
++        gamma_ps_ = Shader(kGammaPs, false, hps);
++        VkPipelineShaderStageCreateInfo stages[2]{};
++        stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++        stages[0].module = gamma_vs_;
++        stages[0].pName = "main";
++        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++        stages[1].module = gamma_ps_;
++        stages[1].pName = "main";
++        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++        vp.viewportCount = vp.scissorCount = 1;
++        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++        rs.polygonMode = VK_POLYGON_MODE_FILL;
++        rs.cullMode = VK_CULL_MODE_NONE;
++        rs.lineWidth = 1;
++        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
++        VkPipelineColorBlendAttachmentState ba{};
++        ba.colorWriteMask = 0xF;
++        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++        cb.attachmentCount = 1;
++        cb.pAttachments = &ba;
++        VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
++        VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++        dy.dynamicStateCount = 2;
++        dy.pDynamicStates = dyn;
++        VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++        pi.stageCount = 2;
++        pi.pStages = stages;
++        pi.pVertexInputState = &vi;
++        pi.pInputAssemblyState = &ia;
++        pi.pViewportState = &vp;
++        pi.pRasterizationState = &rs;
++        pi.pMultisampleState = &ms;
++        pi.pDepthStencilState = &ds;
++        pi.pColorBlendState = &cb;
++        pi.pDynamicState = &dy;
++        pi.layout = pipeline_layout_;
++        pi.renderPass = Pass(true, false);
++        Check(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pi, nullptr, &gamma_pipe_), "gamma pipeline");
++    }
++    return true;
++}
 +#ifdef __ANDROID__
 +bool Vulkan::RecreateSurface() {
-+    Submit();
++    Drain();
 +    Check(vkQueueWaitIdle(queue_), "surface recreate idle");
++    for (VkSemaphore s : swap_done_)
++        if (s) vkDestroySemaphore(device_, s, nullptr);
++    swap_done_.clear();
 +    if (swap_) {
 +        vkDestroySwapchainKHR(device_, swap_, nullptr);
 +        swap_ = VK_NULL_HANDLE;
@@ -264,7 +1222,8 @@
 +#endif
      if (swap_ && extent_.width == size.width && extent_.height == size.height)
          return;
-     Submit();
+-    Submit();
++    Drain();
      Check(vkQueueWaitIdle(queue_), "swapchain idle");
      VkSurfaceCapabilitiesKHR caps;
 -    Check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_, surface_, &caps), "surface capabilities");
@@ -279,7 +1238,7 @@
      if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
          Fail("swapchain transfer destination unavailable");
      uint32_t n = 0;
-@@ -1468,15 +1602,24 @@
+@@ -1468,15 +1894,24 @@
          ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
      ci.imageFormat = choice.format;
      ci.imageColorSpace = choice.colorSpace;
@@ -305,7 +1264,7 @@
      ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
      if (!(caps.supportedCompositeAlpha & ci.compositeAlpha))
          ci.compositeAlpha =
-@@ -1484,8 +1627,15 @@
+@@ -1484,8 +1919,18 @@
      ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
      ci.clipped = VK_TRUE;
      ci.oldSwapchain = swap_;
@@ -320,31 +1279,38 @@
 +    }
 +#endif
 +    Check(sc_res, "swapchain");
++    for (VkSemaphore s : swap_done_)
++        if (s) vkDestroySemaphore(device_, s, nullptr);
++    swap_done_.clear();
      if (swap_)
          vkDestroySwapchainKHR(device_, swap_, nullptr);
      swap_ = next;
-@@ -1494,7 +1644,8 @@
+@@ -1494,7 +1939,12 @@
      Check(vkGetSwapchainImagesKHR(device_, swap_, &n, nullptr), "swapchain images");
      swap_images_.resize(n);
      Check(vkGetSwapchainImagesKHR(device_, swap_, &n, swap_images_.data()), "swapchain images");
 -    LOGR("vulkan: swapchain %ux%u", extent_.width, extent_.height);
++    swap_done_.resize(n);
++    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
++    for (uint32_t i = 0; i < n; i++)
++        Check(vkCreateSemaphore(device_, &sci, nullptr, &swap_done_[i]), "present semaphore");
 +    LOGR("vulkan: swapchain %ux%u (transform=0x%X, current=0x%X)", extent_.width, extent_.height,
 +         unsigned(ci.preTransform), unsigned(caps.currentTransform));
  }
  void Vulkan::Capture(Image &t) {
      auto dir = diag::CaptureDir();
-@@ -1511,6 +1662,18 @@
+@@ -1511,6 +1961,18 @@
      LOGR("vulkan: captured %s", file.c_str());
  }
  void Vulkan::Present(const Surface &front) {
 +#ifdef __ANDROID__
 +    if (!host::Foreground()) {
-+        Submit();
++        Drain();
 +        host::WaitForeground();
 +    }
 +    if (surface_lost_ || host::SurfaceEpoch() != surface_epoch_) {
 +        if (!RecreateSurface()) {
-+            Submit();
++            Drain();
 +            return;
 +        }
 +    }
@@ -352,22 +1318,124 @@
      Image *t = Target(front, false);
      if (!t)
          Fail("present has no front surface");
-@@ -1524,6 +1687,14 @@
+@@ -1519,37 +1981,74 @@
+     Resize();
+     auto size = app::LinuxWindowSize();
+     if (!swap_ || !size.width || !size.height) {
+-        Submit();
++        Submit(true);
+         return;
      }
++    if (!gamma_identity_) {
++        EnsureGammaResources(t->w, t->h);
++        Layout(*t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        Layout(*gamma_lut_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++        VkDescriptorBufferInfo dummy{arena_, 0, alignment_};
++        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
++        ai.descriptorPool = CurrentSlot().descriptor_pool;
++        ai.descriptorSetCount = 1;
++        ai.pSetLayouts = &descriptors_;
++        VkDescriptorSet set{};
++        Check(vkAllocateDescriptorSets(device_, &ai, &set), "gamma descriptors");
++        VkDescriptorImageInfo im[8]{};
++        for (int i = 0; i < 4; i++) {
++            Image *img = i == 0 ? t : (i == 1 ? gamma_lut_.get() : white_.get());
++            im[i] = {VK_NULL_HANDLE, img->sample, img->layout};
++            im[4 + i] = {gamma_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
++        }
++        VkWriteDescriptorSet writes[10]{};
++        for (uint32_t i = 0; i < 10; i++) {
++            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++            writes[i].dstSet = set;
++            writes[i].dstBinding = i;
++            writes[i].descriptorCount = 1;
++            writes[i].descriptorType = i < 2   ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
++                                       : i < 6 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
++                                               : VK_DESCRIPTOR_TYPE_SAMPLER;
++            if (i < 2)
++                writes[i].pBufferInfo = &dummy;
++            else
++                writes[i].pImageInfo = &im[i - 2];
++        }
++        vkUpdateDescriptorSets(device_, 10, writes, 0, nullptr);
++        BeginRender(gamma_out_.get(), nullptr);
++        VkCommandBuffer cb = Cmd();
++        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, gamma_pipe_);
++        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
++        VkViewport vp{0, 0, float(t->w), float(t->h), 0, 1};
++        VkRect2D sc{{0, 0}, {t->w, t->h}};
++        vkCmdSetViewport(cb, 0, 1, &vp);
++        vkCmdSetScissor(cb, 0, 1, &sc);
++        vkCmdDraw(cb, 3, 1, 0, 0);
++        EndRender();
++    }
++    Image &source = !gamma_identity_ ? *gamma_out_ : *t;
++    Layout(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    EndRender();
++    FrameSlot &f = CurrentSlot();
      uint32_t index = 0;
-     VkResult result = vkAcquireNextImageKHR(device_, swap_, 30000000000ull, acquired_, VK_NULL_HANDLE, &index);
+-    VkResult result = vkAcquireNextImageKHR(device_, swap_, 30000000000ull, acquired_, VK_NULL_HANDLE, &index);
++    VkResult result = vkAcquireNextImageKHR(device_, swap_, 30000000000ull, f.acquired, VK_NULL_HANDLE, &index);
 +#ifdef __ANDROID__
 +    if (result == VK_ERROR_SURFACE_LOST_KHR) {
 +        LOGW("vulkan: acquire surface lost, scheduling recreate");
 +        surface_lost_ = true;
-+        Submit();
++        Submit(true);
 +        return;
 +    }
 +#endif
      if (result == VK_ERROR_OUT_OF_DATE_KHR) {
++        Submit(true);
          extent_ = {};
          Resize();
-@@ -1584,6 +1755,12 @@
+         return;
+     }
+     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+         Check(result, "acquire swapchain");
+-    std::unique_ptr<Image> adjusted;
+-    if (!gamma_identity_) {
+-        std::vector<uint8_t> px;
+-        Read(*t, px);
+-        for (size_t i = 0; i < px.size(); i += 4) {
+-            px[i] = gamma_[512 + px[i]];
+-            px[i + 1] = gamma_[256 + px[i + 1]];
+-            px[i + 2] = gamma_[px[i + 2]];
+-        }
+-        adjusted = MakeImage(t->w, t->h, 1, 1, 1, VK_FORMAT_B8G8R8A8_UNORM, false, false);
+-        Layout(*adjusted, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+-        VkBufferImageCopy c{};
+-        c.bufferOffset = Upload(px.data(), px.size());
+-        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+-        c.imageExtent = {t->w, t->h, 1};
+-        vkCmdCopyBufferToImage(cmd_, arena_, adjusted->image, adjusted->layout, 1, &c);
+-    }
+-    Image &source = adjusted ? *adjusted : *t;
+-    Layout(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+     Image back;
+     back.image = swap_images_[index];
+     back.w = extent_.width;
+@@ -1558,7 +2057,7 @@
+     Layout(back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     VkClearColorValue black{};
+     VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+-    vkCmdClearColorImage(cmd_, back.image, back.layout, &black, 1, &range);
++    vkCmdClearColorImage(Cmd(), back.image, back.layout, &black, 1, &range);
+     float aspect = app::FrameAspect();
+     int w = int(extent_.width), h = int(extent_.height);
+     if (aspect > 0) {
+@@ -1576,23 +2075,36 @@
+     blit.srcOffsets[1] = {int(source.w) - cx, int(source.h) - cy, 1};
+     blit.dstOffsets[0] = {x, y, 0};
+     blit.dstOffsets[1] = {x + w, y + h, 1};
+-    vkCmdBlitImage(cmd_, source.image, source.layout, back.image, back.layout, 1, &blit, VK_FILTER_LINEAR);
++    vkCmdBlitImage(Cmd(), source.image, source.layout, back.image, back.layout, 1, &blit, VK_FILTER_LINEAR);
+     Layout(back, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+-    Submit(acquired_);
++    Submit(false, f.acquired, swap_done_[index]);
+     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
++    pi.waitSemaphoreCount = 1;
++    pi.pWaitSemaphores = &swap_done_[index];
+     pi.swapchainCount = 1;
      pi.pSwapchains = &swap_;
      pi.pImageIndices = &index;
      result = vkQueuePresentKHR(queue_, &pi);
@@ -379,4 +1447,78 @@
 +#endif
      if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR && result != VK_ERROR_OUT_OF_DATE_KHR)
          Check(result, "present");
-     if (adjusted)
+-    if (adjusted)
+-        DestroyImage(*adjusted);
+     frame_++;
+-    if (frame_ % 60 == 0)
+-        LOGR("vulkan: frames=%llu draws=%llu pipelines=%zu textures=%zu", static_cast<unsigned long long>(frame_),
+-             static_cast<unsigned long long>(draws_), pipelines_.size(), textures_.size());
+-    // Submitted work has retired; cached sampled textures can now be reclaimed safely.
++    slot_ = uint32_t(frame_ % kFrames);
++    if (frame_ % 60 == 0) {
++        auto now = std::chrono::steady_clock::now();
++        double ms = std::chrono::duration<double, std::milli>(now - log_time_).count();
++        log_time_ = now;
++        double fps = ms > 0.0 ? 60000.0 / ms : 0.0;
++        LOGR("vulkan: frames=%llu draws=%llu pipelines=%zu textures=%zu fps=%.1f (%.1f ms/frame)",
++             static_cast<unsigned long long>(frame_), static_cast<unsigned long long>(draws_), pipelines_.size(),
++             textures_.size(), fps, ms / 60.0);
++    }
++    // Cached textures unused for >120 frames have long finished on GPU.
+     for (auto it = textures_.begin(); it != textures_.end();)
+         if (frame_ - it->second->used > 120) {
+             DestroyImage(*it->second);
+@@ -1608,32 +2120,47 @@
+         vkDestroyFramebuffer(device_, v, nullptr);
+     for (auto [k, v] : pipelines_)
+         vkDestroyPipeline(device_, v, nullptr);
++    if (gamma_pipe_)
++        vkDestroyPipeline(device_, gamma_pipe_, nullptr);
+     for (auto [k, v] : passes_)
+         vkDestroyRenderPass(device_, v, nullptr);
+     for (auto [k, v] : shaders_)
+         vkDestroyShaderModule(device_, v, nullptr);
+     for (auto [k, v] : samplers_)
+         vkDestroySampler(device_, v, nullptr);
++    if (gamma_sampler_)
++        vkDestroySampler(device_, gamma_sampler_, nullptr);
+     for (auto &[k, v] : targets_)
+         DestroyImage(*v);
+     for (auto &[k, v] : textures_)
+         DestroyImage(*v);
+-    for (auto &t : transient_)
+-        DestroyImage(*t);
++    for (auto &slot : slots_) {
++        for (auto &t : slot.retire)
++            DestroyImage(*t);
++        slot.retire.clear();
++    }
+     if (white_)
+         DestroyImage(*white_);
++    if (gamma_lut_)
++        DestroyImage(*gamma_lut_);
++    if (gamma_out_)
++        DestroyImage(*gamma_out_);
++    for (VkSemaphore s : swap_done_)
++        if (s) vkDestroySemaphore(device_, s, nullptr);
+     if (swap_)
+         vkDestroySwapchainKHR(device_, swap_, nullptr);
+     vkDestroyQueryPool(device_, queries_, nullptr);
+-    vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
+     vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
+     vkDestroyDescriptorSetLayout(device_, descriptors_, nullptr);
+     vkUnmapMemory(device_, arena_mem_);
+     vkDestroyBuffer(device_, arena_, nullptr);
+     vkFreeMemory(device_, arena_mem_, nullptr);
+-    vkDestroySemaphore(device_, acquired_, nullptr);
+-    vkDestroyFence(device_, fence_, nullptr);
+-    vkDestroyCommandPool(device_, pool_, nullptr);
++    for (auto &slot : slots_) {
++        if (slot.descriptor_pool) vkDestroyDescriptorPool(device_, slot.descriptor_pool, nullptr);
++        if (slot.acquired) vkDestroySemaphore(device_, slot.acquired, nullptr);
++        if (slot.fence) vkDestroyFence(device_, slot.fence, nullptr);
++        if (slot.pool) vkDestroyCommandPool(device_, slot.pool, nullptr);
++    }
+     vkDestroyDevice(device_, nullptr);
+     vkDestroySurfaceKHR(instance_, surface_, nullptr);
+     vkDestroyInstance(instance_, nullptr);
