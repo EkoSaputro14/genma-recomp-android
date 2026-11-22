@@ -24,7 +24,7 @@ target_compile_definitions(genma_android PRIVATE
     GENMA_ANDROID_PORT=1
     GENMA_MIN_SDK=29
     GENMA_VULKAN_10_FALLBACK=1
-    GENMA_HD_TEXTURE_BUDGET_MB=1152
+    GENMA_HD_TEXTURE_BUDGET_MB=512
 )
 
 target_compile_options(genma_android PRIVATE

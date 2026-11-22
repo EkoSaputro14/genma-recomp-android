@@ -193,7 +193,7 @@ jobs:
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`
             - **Grafis**: Vulkan 1.0+ Fallback (Adreno/Mali) + SPIR-V pra-kompilasi
             - **Folder Data di HP**: `/storage/emulated/0/GenmaOnimusha` (salin `.iso` atau ekstrak `default.xbe` beserta folder game, dan opsional `textures/` untuk HD Texture Pack)
-            - **Kontrol & UI**: Gamepad Bluetooth/USB-C + Overlay sentuh virtual + Menu ImGui ramah sentuh (1.55x DPI)
+            - **Kontrol & UI**: Gamepad Bluetooth/USB-C + Overlay sentuh virtual + Menu ImGui ramah sentuh (1.45x DPI)
 
             > Untuk mode **Standalone APK tanpa PC di HP** (seperti `Black-Android`), enkripsi `default.xbe` legal Anda menjadi `ci/default.xbe.enc` memakai `tools/encrypt_xbe_for_ci.sh` dan simpan kata sandinya di GitHub Secret `XBE_KEY` (disarankan pada repositori *private*).
           files: |

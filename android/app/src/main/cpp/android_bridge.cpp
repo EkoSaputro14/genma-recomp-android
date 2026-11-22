@@ -129,7 +129,7 @@ Java_com_genmarecomp_android_GenmaActivity_nativeRunSelfCheck(JNIEnv* env, jobje
         "Vulkan GPU: " + g_gpuName + " (v" + std::to_string(vkMajor) + "." + std::to_string(vkMinor) + ")\n"
         "Bundled Game Core (libgenma_game.so): " + std::string(g_gameLibLoaded ? "TERBUNDEL (SIAP)" : "BELUM TERBUNDEL") + "\n"
         "Folder Data Game: " + g_gameDataPath + "\n"
-        "Folder HD Textures: " + g_texturePackPath + " (Cache 1152 MB)\n"
+        "Folder HD Textures: " + g_texturePackPath + " (Cache 512 MB)\n"
         "ARM64 Timer Ticks: " + std::to_string(ticks) + "\n"
         "Status: " + g_lastStatus;
 

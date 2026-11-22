@@ -17,7 +17,7 @@ struct TextureEntry {
 
 class MobileHdTextureCache {
 public:
-    explicit MobileHdTextureCache(size_t budgetBytes = 1207959552ull)
+    explicit MobileHdTextureCache(size_t budgetBytes = 536870912ull)
         : budgetBytes_(budgetBytes) {}
 
     void SetRootDirectory(const std::string& path);
@@ -79,7 +79,7 @@ void MobileHdTextureCache::Clear() {
 }
 
 MobileHdTextureCache& GetMobileTextureCache() {
-    static MobileHdTextureCache cache(1207959552ull);
+    static MobileHdTextureCache cache(536870912ull);
     return cache;
 }
 
