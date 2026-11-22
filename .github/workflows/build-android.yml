@@ -33,7 +33,7 @@ permissions:
 jobs:
   build-android-apk:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -57,6 +57,40 @@ jobs:
             "build-tools;35.0.0" \
             "ndk;27.2.12479018" \
             "cmake;3.22.1"
+
+      - name: Recompile Encrypted default.xbe on CI (Black-Android Standalone Mode)
+        id: recomp
+        env:
+          XBE_KEY: ${{ secrets.XBE_KEY }}
+        run: |
+          if [[ -f "ci/default.xbe.enc" && -n "$XBE_KEY" && -f "config/game.toml" && -d "sdk/tools/recomp" ]]; then
+            echo "mode=standalone" >> $GITHUB_OUTPUT
+            mkdir -p assets generated/game android/app/src/main/jniLibs/arm64-v8a
+            key_file="$RUNNER_TEMP/xbe.key"
+            printf '%s' "$XBE_KEY" > "$key_file"
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+              -in ci/default.xbe.enc -out assets/default.xbe -pass "file:$key_file"
+            rm -f "$key_file"
+            sha1sum assets/default.xbe
+
+            sudo apt-get update && sudo apt-get install -y clang ninja-build
+            cmake --preset linux-core
+            cmake --build --preset linux-core --target xbe_recomp xbe_symbols --parallel "$(nproc)"
+            ./out/build/linux-core/xbe_recomp config/game.toml --xbe assets/default.xbe --out generated/game
+
+            TOOLCHAIN="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++"
+            "$TOOLCHAIN" -shared -fPIC -std=c++20 -O3 \
+              -Isdk/runtime -Isrc/game \
+              generated/game/*.cpp \
+              src/game/modern_controls.cpp \
+              src/game/background_streaming.cpp \
+              src/game/math_flags.cpp \
+              -o android/app/src/main/jniLibs/arm64-v8a/libgenma_game.so
+            ls -lh android/app/src/main/jniLibs/arm64-v8a/libgenma_game.so
+          else
+            echo "mode=asset-free-runtime" >> $GITHUB_OUTPUT
+            echo "::notice::ci/default.xbe.enc atau secret XBE_KEY tidak ditemukan; membangun APK Runtime Asset-Free."
+          fi
 
       - name: Prepare APK Signing Keystore
         run: |
@@ -101,6 +135,7 @@ jobs:
 
           tar -czf "release-dist/GenmaOnimusha-${VERSION}-pc-android-builder.tar.gz" \
             tools/build_android_pc.sh \
+            tools/encrypt_xbe_for_ci.sh \
             docs/android-port-guide.md \
             sdk/runtime/xdk/fiber_android.h \
             sdk/runtime/kernel/memory_android.cpp \
@@ -127,16 +162,15 @@ jobs:
           prerelease: true
           generate_release_notes: true
           body: |
-            ### Genma Onimusha — Unofficial Android ARM64 Port (${{ steps.pkg.outputs.version }})
+            ### Genma Onimusha — Android ARM64 Port (${{ steps.pkg.outputs.version }})
 
-            > **Penting (Asset-Free Release)**: APK ini tidak menyertakan kode biner `default.xbe` maupun aset game asli Capcom. Gunakan salinan legal **Genma Onimusha (USA)** milik Anda melalui skrip PC cross-compile (`tools/build_android_pc.sh`).
-
-            #### Spesifikasi Build
+            - **Mode Build CI**: `${{ steps.recomp.outputs.mode }}`
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`
             - **Grafis**: Vulkan 1.0+ Fallback (Adreno/Mali) + SPIR-V pra-kompilasi
-            - **Core ARM64**: Pengganti fiber Bionic ARM64 murni (`fiber_android.h`) & alias memori fisik 4 GiB (`syscall(SYS_memfd_create)` + `ASharedMemory`)
+            - **Folder Data di HP**: `/storage/emulated/0/GenmaOnimusha` (salin `.iso` atau ekstrak `default.xbe` beserta folder game, dan opsional `textures/` untuk HD Texture Pack)
             - **Kontrol & UI**: Gamepad Bluetooth/USB-C + Overlay sentuh virtual + Menu ImGui ramah sentuh (1.45x DPI)
-            - **HD Texture Pack**: Dukungan penyimpanan SAF dengan cache mobile 512 MB
+
+            > Untuk mode **Standalone APK tanpa PC di HP** (seperti `Black-Android`), enkripsi `default.xbe` legal Anda menjadi `ci/default.xbe.enc` memakai `tools/encrypt_xbe_for_ci.sh` dan simpan kata sandinya di GitHub Secret `XBE_KEY` (disarankan pada repositori *private*).
           files: |
             release-dist/*.apk
             release-dist/*.tar.gz

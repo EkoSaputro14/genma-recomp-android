@@ -26,17 +26,38 @@ bool IsTouchMenuOpen();
 }
 
 namespace gpu_android {
-class MobileHdTextureCache;
+class MobileHdTextureCache {
+public:
+    void SetRootDirectory(const std::string& path);
+};
+MobileHdTextureCache& GetMobileTextureCache();
 }
 
 namespace {
 void* g_recompiledGameLib = nullptr;
-std::string g_lastStatus = "Runtime siap. Pilih folder game/libgenma_game.so hasil build PC.";
+std::string g_gameDataPath = "/storage/emulated/0/GenmaOnimusha";
+std::string g_texturePackPath = "/storage/emulated/0/GenmaOnimusha/textures";
+std::string g_lastStatus = "Menunggu berkas ISO / default.xbe di /storage/emulated/0/GenmaOnimusha";
 bool g_memoryOk = false;
 bool g_aliasOk = false;
 bool g_fiberOk = false;
+bool g_gameLibLoaded = false;
 std::string g_gpuName = "Belum diinisialisasi";
 uint32_t g_vkApiVersion = VK_API_VERSION_1_0;
+
+void TryAutoLoadBundledGameLib() {
+    if (g_recompiledGameLib) return;
+    // When built via CI standalone mode (ci/default.xbe.enc + XBE_KEY), libgenma_game.so is bundled inside the APK
+    g_recompiledGameLib = dlopen("libgenma_game.so", RTLD_NOW | RTLD_LOCAL);
+    if (g_recompiledGameLib) {
+        g_gameLibLoaded = true;
+        g_lastStatus = "Modul recompiled libgenma_game.so terbundel di dalam APK (siap dijalankan langsung di HP).";
+        LOGI("Auto-loaded bundled libgenma_game.so");
+    } else {
+        g_gameLibLoaded = false;
+        g_lastStatus = "Mode runtime asset-free: tambahkan ci/default.xbe.enc + secret XBE_KEY di GitHub Actions untuk membundel libgenma_game.so langsung ke APK.";
+    }
+}
 
 void ProbeVulkanDevice() {
     VkApplicationInfo appInfo{};
@@ -94,6 +115,7 @@ Java_com_genmarecomp_android_GenmaActivity_nativeRunSelfCheck(JNIEnv* env, jobje
     g_aliasOk = g_memoryOk && mem_android::VerifyPhysicalAlias();
     g_fiberOk = SelfTestArm64Fiber();
     ProbeVulkanDevice();
+    TryAutoLoadBundledGameLib();
 
     input_android::OverlaySettings overlay{};
     input_android::InitOverlay(overlay);
@@ -103,17 +125,39 @@ Java_com_genmarecomp_android_GenmaActivity_nativeRunSelfCheck(JNIEnv* env, jobje
     const uint32_t vkMinor = VK_VERSION_MINOR(g_vkApiVersion);
 
     std::string report =
-        "ABI: arm64-v8a | API 29+\n"
+        "ABI: arm64-v8a | API 29+ | Mode: Standalone APK (CI Recomp)\n"
         "ARM64 Bionic Fiber: " + std::string(g_fiberOk ? "OK" : "GAGAL") + "\n"
         "Guest 4 GiB Virtual Space: " + std::string(g_memoryOk ? "OK" : "GAGAL") + "\n"
         "Xbox Physical Alias (0x80000000/0xF0000000): " + std::string(g_aliasOk ? "OK" : "GAGAL") + "\n"
         "Vulkan GPU: " + g_gpuName + " (v" + std::to_string(vkMajor) + "." + std::to_string(vkMinor) + ")\n"
-        "HD Texture Budget: 512 MB\n"
+        "Bundled Game Core (libgenma_game.so): " + std::string(g_gameLibLoaded ? "TERBUNDEL (SIAP)" : "BELUM TERBUNDEL") + "\n"
+        "Folder Data Game: " + g_gameDataPath + "\n"
+        "Folder HD Textures: " + g_texturePackPath + " (Cache 512 MB)\n"
         "ARM64 Timer Ticks: " + std::to_string(ticks) + "\n"
         "Status: " + g_lastStatus;
 
-    LOGI("Self-check completed: fiber=%d mem=%d alias=%d gpu=%s", g_fiberOk, g_memoryOk, g_aliasOk, g_gpuName.c_str());
+    LOGI("Self-check completed: fiber=%d mem=%d alias=%d gameLib=%d gpu=%s", g_fiberOk, g_memoryOk, g_aliasOk, g_gameLibLoaded, g_gpuName.c_str());
     return env->NewStringUTF(report.c_str());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_genmarecomp_android_GenmaActivity_nativeSetGamePaths(
+    JNIEnv* env, jobject, jstring dataDir, jstring texDir) {
+    if (dataDir) {
+        const char* p = env->GetStringUTFChars(dataDir, nullptr);
+        if (p) {
+            g_gameDataPath = p;
+            env->ReleaseStringUTFChars(dataDir, p);
+        }
+    }
+    if (texDir) {
+        const char* t = env->GetStringUTFChars(texDir, nullptr);
+        if (t) {
+            g_texturePackPath = t;
+            gpu_android::GetMobileTextureCache().SetRootDirectory(g_texturePackPath);
+            env->ReleaseStringUTFChars(texDir, t);
+        }
+    }
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
