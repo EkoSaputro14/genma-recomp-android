@@ -215,7 +215,7 @@
          query_sum_ = 0;
      }
      void GetReport(uint32_t) override;
-@@ -308,14 +365,19 @@
+@@ -308,13 +365,19 @@
      vkGetPhysicalDeviceMemoryProperties(physical_, &memory_);
      VkPhysicalDeviceFeatures features{};
      vkGetPhysicalDeviceFeatures(physical_, &features);
@@ -231,15 +231,14 @@
      enable.independentBlend = features.independentBlend;
      enable.fillModeNonSolid = features.fillModeNonSolid;
      enable.occlusionQueryPrecise = features.occlusionQueryPrecise;
--    float priority = 1;
 +#ifdef __ANDROID__
 +    vkshader::Init(app::CacheDir() / "shader-cache-vulkan");
 +    surface_epoch_ = host::SurfaceEpoch();
 +#endif
+     float priority = 1;
      VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
      qi.queueFamilyIndex = family_;
-     qi.queueCount = 1;
-@@ -329,19 +391,6 @@
+@@ -329,19 +392,6 @@
      di.pEnabledFeatures = &enable;
      Check(vkCreateDevice(physical_, &di, nullptr, &device_), "create device");
      vkGetDeviceQueue(device_, family_, 0, &queue_);
@@ -259,7 +258,7 @@
      VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
      bi.size = kArena;
      bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-@@ -379,11 +428,28 @@
+@@ -379,11 +429,28 @@
      VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768},
                                      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 65536},
                                      {VK_DESCRIPTOR_TYPE_SAMPLER, 65536}};
@@ -293,7 +292,7 @@
      VkQueryPoolCreateInfo qp{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
      qp.queryType = VK_QUERY_TYPE_OCCLUSION;
      qp.queryCount = 8192;
-@@ -397,62 +463,127 @@
+@@ -397,62 +464,127 @@
      cp.bufferOffset = off;
      cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
      cp.imageExtent = {1, 1, 1};
@@ -456,7 +455,7 @@
  }
  std::unique_ptr<Image> Vulkan::MakeImage(uint32_t w, uint32_t h, uint32_t depth, uint32_t levels, uint32_t layers,
                                           VkFormat format, bool z, bool target) {
-@@ -509,39 +640,142 @@
+@@ -509,39 +641,142 @@
      vkDestroyImage(device_, t.image, nullptr);
      vkFreeMemory(device_, t.memory, nullptr);
  }
@@ -611,7 +610,7 @@
          }
      Layout(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
  }
-@@ -587,11 +821,11 @@
+@@ -587,11 +822,11 @@
      copy.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
      copy.imageExtent = {d.width, d.height, 1};
      copy.bufferOffset = Upload(depth.data(), depth.size() * 4);
@@ -626,7 +625,7 @@
      image.epoch = DirtyEpoch(d.data);
      image.drawn = true;
      LOG_FIRST(4, "vulkan: CPU depth imported %08X, %ux%u", d.data, d.width, d.height);
-@@ -605,8 +839,8 @@
+@@ -605,8 +840,8 @@
      uint64_t key = uint64_t(d.data) << 1 | uint64_t(z);
      auto &p = targets_[key];
      if (p && (p->w != d.width || p->h != d.height)) {
@@ -637,7 +636,7 @@
              vkDestroyFramebuffer(device_, fb, nullptr);
          framebuffers_.clear();
          DestroyImage(*p);
-@@ -615,25 +849,32 @@
+@@ -615,25 +850,32 @@
      if (!p) {
          p = MakeImage(d.width, d.height, 1, 1, 1, z ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_B8G8R8A8_UNORM, z, true);
          p->desc = d;
@@ -683,7 +682,7 @@
          }
      }
      return p.get();
-@@ -644,44 +885,65 @@
+@@ -644,44 +886,65 @@
      TextureDesc d;
      if (!Describe(header, d))
          Fail("invalid texture");
@@ -779,7 +778,7 @@
      return p.get();
  }
  VkSampler Vulkan::Sampler(const State &s, int stage, bool shadow) {
-@@ -813,6 +1075,11 @@
+@@ -813,6 +1076,11 @@
      auto it = shaders_.find(key);
      if (it != shaders_.end())
          return it->second;
@@ -791,7 +790,7 @@
      auto dir = app::CacheDir() / "shader-cache-vulkan";
      std::filesystem::create_directories(dir);
      std::string name = std::to_string(key);
-@@ -876,11 +1143,12 @@
+@@ -876,11 +1144,12 @@
      auto size = f.tellg();
      if (size <= 0 || size % 4)
          Fail("invalid SPIR-V file");
@@ -805,7 +804,7 @@
      VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
      ci.codeSize = words.size() * 4;
      ci.pCode = words.data();
-@@ -1121,9 +1389,11 @@
+@@ -1121,9 +1390,11 @@
          return;
      if (a.buffer_count != 1 || a.decode)
          Fail("Linux requires converted float4 vertex assembly");
@@ -819,7 +818,7 @@
      Image *rt = Target(s.rt, false);
      Image *ds = Target(s.zs, true);
      if (!rt && !ds)
-@@ -1133,7 +1403,8 @@
+@@ -1133,7 +1404,8 @@
      for (int i = 0; i < 4; i++) {
          images[size_t(i)] = Texture(s.textures[size_t(i)], s.palettes[size_t(i)]);
          auto *t = images[size_t(i)];
@@ -829,7 +828,7 @@
          if (s.textures[size_t(i)]) {
              info[i].kind = t->layers == 6 ? kTexCube : t->depth > 1 ? kTex3D : kTex2D;
              info[i].rect = t->desc.linear ? 1 : 0;
-@@ -1144,13 +1415,14 @@
+@@ -1144,13 +1416,14 @@
              auto snapshot = MakeImage(t->w, t->h, 1, 1, 1, t->format, t->z, false);
              Layout(*t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
              Layout(*snapshot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -846,7 +845,7 @@
              t = images[size_t(i)];
          }
          Layout(*t, t->z ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-@@ -1173,7 +1445,7 @@
+@@ -1173,7 +1446,7 @@
          {arena_, Upload(s.vsc.data(), sizeof(s.vsc), size_t(alignment_)), sizeof(s.vsc)},
          {arena_, Upload(&dc, sizeof(dc), size_t(alignment_)), sizeof(dc)}};
      VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -855,7 +854,7 @@
      ai.descriptorSetCount = 1;
      ai.pSetLayouts = &descriptors_;
      VkDescriptorSet set;
-@@ -1204,25 +1476,16 @@
+@@ -1204,25 +1477,16 @@
      VkDeviceSize ib = 0;
      if (a.index_count)
          ib = Upload(a.index_src, size_t(a.index_count) * (a.index16 ? 2 : 4));
@@ -888,7 +887,7 @@
      VkRect2D sc{{0, 0}, {fw, fh}};
      if (s.scissor_count) {
          if (s.scissor_count > 1)
-@@ -1238,22 +1501,21 @@
+@@ -1238,22 +1502,21 @@
      int y1 = std::min(sc.offset.y + int(sc.extent.height),
                        int(std::min(uint64_t(s.viewport.y) + s.viewport.h, uint64_t(fh))));
      sc = {{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
@@ -920,7 +919,7 @@
      if (rt)
          rt->drawn = true;
      if (ds)
-@@ -1271,12 +1533,13 @@
+@@ -1271,12 +1534,13 @@
          return;
      Begin();
      if (!count) {
@@ -935,7 +934,7 @@
              rt->drawn = true;
          }
          if (ds) {
-@@ -1285,26 +1548,17 @@
+@@ -1285,26 +1549,17 @@
              VkImageAspectFlags aspects = ((flags & kClearZ) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
                                           ((flags & kClearStencil) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
              VkImageSubresourceRange r{aspects, 0, 1, 0, 1};
@@ -965,7 +964,7 @@
      VkClearAttachment attachments[2]{};
      uint32_t n = 0;
      if (rt) {
-@@ -1327,10 +1581,9 @@
+@@ -1327,10 +1582,9 @@
          int x1 = std::clamp(r[2], x0, int(w)), y1 = std::clamp(r[3], y0, int(h));
          if (x1 > x0 && y1 > y0) {
              VkClearRect cr{{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, 0, 1};
@@ -977,7 +976,7 @@
  }
  void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32_t rects, uint32_t points) {
      LOG_FIRST(12, "vulkan: CopyRects src=%08X dst=%08X count=%u rects=%08X points=%08X", src.data, dst.data, count,
-@@ -1350,8 +1603,15 @@
+@@ -1350,8 +1604,15 @@
              Fail("unsupported CPU CopyRects format");
          if (bz)
              UploadDepth(*Target(dst, true), b);
@@ -995,7 +994,7 @@
          return;
      }
      Image *from = Target(src, az);
-@@ -1362,6 +1622,7 @@
+@@ -1362,6 +1623,7 @@
          Fail("overlapping CopyRects requires an intermediate image");
      Layout(*from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
      Layout(*to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -1003,7 +1002,7 @@
      uint32_t copies = count && rects ? count : 1;
      for (uint32_t i = 0; i < copies; i++) {
          int32_t r[4] = {0, 0, int32_t(std::min(from->w, to->w)), int32_t(std::min(from->h, to->h))}, p[2] = {0, 0};
-@@ -1382,10 +1643,10 @@
+@@ -1382,10 +1644,10 @@
          c.srcOffset = {r[0], r[1], 0};
          c.dstOffset = {p[0], p[1], 0};
          c.extent = {uint32_t(r[2] - r[0]), uint32_t(r[3] - r[1]), 1};
@@ -1016,7 +1015,7 @@
          }
      }
      to->drawn = true;
-@@ -1394,19 +1655,20 @@
+@@ -1394,19 +1656,20 @@
      if (t.z)
          Fail("CPU depth readback not yet implemented");
      Layout(t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -1040,7 +1039,7 @@
      out.assign(mapped_ + off, mapped_ + off + bytes);
  }
  void Vulkan::Sync(uint32_t data, uint32_t) {
-@@ -1421,11 +1683,12 @@
+@@ -1421,11 +1684,12 @@
      auto *guest = static_cast<uint8_t *>(kernel::HostPtr(data));
      for (uint32_t y = 0; y < t.h; y++)
          std::memcpy(guest + size_t(y) * t.desc.pitch, px.data() + size_t(y) * t.w * 4, t.w * 4);
@@ -1055,7 +1054,7 @@
      kernel::W32(va, uint32_t(frame_));
      kernel::W32(va + 4, 0);
      kernel::W32(va + 8, uint32_t(std::min<uint64_t>(query_sum_, 0xffffffffu)));
-@@ -1438,17 +1701,180 @@
+@@ -1438,17 +1702,180 @@
      for (int c = 0; c < 3; c++)
          for (int i = 0; i < 256; i++)
              gamma_identity_ &= ramp[c * 256 + i] == i;
@@ -1238,7 +1237,7 @@
      if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
          Fail("swapchain transfer destination unavailable");
      uint32_t n = 0;
-@@ -1468,15 +1894,24 @@
+@@ -1468,15 +1895,24 @@
          ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
      ci.imageFormat = choice.format;
      ci.imageColorSpace = choice.colorSpace;
@@ -1264,7 +1263,7 @@
      ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
      if (!(caps.supportedCompositeAlpha & ci.compositeAlpha))
          ci.compositeAlpha =
-@@ -1484,8 +1919,18 @@
+@@ -1484,8 +1920,18 @@
      ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
      ci.clipped = VK_TRUE;
      ci.oldSwapchain = swap_;
@@ -1285,7 +1284,7 @@
      if (swap_)
          vkDestroySwapchainKHR(device_, swap_, nullptr);
      swap_ = next;
-@@ -1494,7 +1939,12 @@
+@@ -1494,7 +1940,12 @@
      Check(vkGetSwapchainImagesKHR(device_, swap_, &n, nullptr), "swapchain images");
      swap_images_.resize(n);
      Check(vkGetSwapchainImagesKHR(device_, swap_, &n, swap_images_.data()), "swapchain images");
@@ -1299,7 +1298,7 @@
  }
  void Vulkan::Capture(Image &t) {
      auto dir = diag::CaptureDir();
-@@ -1511,6 +1961,18 @@
+@@ -1511,6 +1962,18 @@
      LOGR("vulkan: captured %s", file.c_str());
  }
  void Vulkan::Present(const Surface &front) {
@@ -1318,7 +1317,7 @@
      Image *t = Target(front, false);
      if (!t)
          Fail("present has no front surface");
-@@ -1519,37 +1981,74 @@
+@@ -1519,37 +1982,74 @@
      Resize();
      auto size = app::LinuxWindowSize();
      if (!swap_ || !size.width || !size.height) {
@@ -1414,7 +1413,7 @@
      Image back;
      back.image = swap_images_[index];
      back.w = extent_.width;
-@@ -1558,7 +2057,7 @@
+@@ -1558,7 +2058,7 @@
      Layout(back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
      VkClearColorValue black{};
      VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -1423,7 +1422,7 @@
      float aspect = app::FrameAspect();
      int w = int(extent_.width), h = int(extent_.height);
      if (aspect > 0) {
-@@ -1576,23 +2075,36 @@
+@@ -1576,23 +2076,36 @@
      blit.srcOffsets[1] = {int(source.w) - cx, int(source.h) - cy, 1};
      blit.dstOffsets[0] = {x, y, 0};
      blit.dstOffsets[1] = {x + w, y + h, 1};
@@ -1468,7 +1467,7 @@
      for (auto it = textures_.begin(); it != textures_.end();)
          if (frame_ - it->second->used > 120) {
              DestroyImage(*it->second);
-@@ -1608,32 +2120,47 @@
+@@ -1608,32 +2121,47 @@
          vkDestroyFramebuffer(device_, v, nullptr);
      for (auto [k, v] : pipelines_)
          vkDestroyPipeline(device_, v, nullptr);
