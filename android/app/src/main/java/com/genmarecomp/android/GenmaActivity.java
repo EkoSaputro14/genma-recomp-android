@@ -17,6 +17,7 @@ import android.view.InputEvent;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 
@@ -42,6 +43,7 @@ public class GenmaActivity extends SDLActivity {
     private boolean notNow;
     private final GameImporter importer = new GameImporter(this);
     private boolean importing;
+    private TouchOverlayView touchOverlay;
 
     private static final boolean ALL_FILES_ACCESS = Build.VERSION.SDK_INT >= 30;
     private static final int STORAGE_REQUEST = 0x474D;
@@ -55,11 +57,24 @@ public class GenmaActivity extends SDLActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (mLayout != null) {
+            touchOverlay = new TouchOverlayView(this, (buttons, analog, lx, ly) -> {
+                if (!mBrokenLibraries) {
+                    nativeTouchPad(buttons, analog, lx, ly);
+                }
+            });
+            mLayout.addView(touchOverlay, new ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT));
+        }
         File own = getExternalFilesDir(null);
         if (own != null) {
             new File(own, "assets").mkdirs();
         }
     }
+
+    // Visual virtual touch overlay bridge -> native/main.cpp
+    private static native void nativeTouchPad(int buttons, byte[] analog, short lx, short ly);
 
     // Loose OEM controller bridge (e.g., MIUI virtualized DualShock 4) forwarded to native/main.cpp.
     private static native void nativeLooseKey(int keyCode, boolean down);

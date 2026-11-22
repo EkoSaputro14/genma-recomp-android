@@ -37,9 +37,10 @@ std::mutex g_foreground_lock;
 std::condition_variable g_foreground_cv;
 std::recursive_mutex g_ui_lock;
 
-// Loose OEM controller state (e.g., MIUI virtualized DualShock 4) forwarded from GenmaActivity.java.
+// Loose OEM controller state & visual TouchOverlayView state forwarded from GenmaActivity.java.
 std::mutex g_loose_lock;
 input::Pad g_loose_pad{};
+input::Pad g_touch_pad{};
 
 std::string Utf8(const wchar_t* w) {
     std::string s;
@@ -91,6 +92,13 @@ void SyncTouchAndLoosePad() {
     {
         std::lock_guard lock(g_loose_lock);
         merged = g_loose_pad;
+        if (g_touch_pad.connected) {
+            merged.connected = true;
+            merged.buttons |= g_touch_pad.buttons;
+            for (int i = 0; i < 8; i++) merged.analog[i] = std::max(merged.analog[i], g_touch_pad.analog[i]);
+            if (g_touch_pad.lx) merged.lx = g_touch_pad.lx;
+            if (g_touch_pad.ly) merged.ly = g_touch_pad.ly;
+        }
     }
     const input_android::VirtualPadState vp = input_android::PollVirtualPad();
     if (vp.leftStickX || vp.leftStickY || vp.buttons || vp.dpadUp || vp.dpadDown || vp.dpadLeft || vp.dpadRight) {
@@ -160,6 +168,23 @@ void Dispatch(const SDL_Event& e) {
 }
 
 }  // namespace
+
+// JNI callback from TouchOverlayView (GenmaActivity.java) for visual virtual gamepad controls.
+extern "C" JNIEXPORT void JNICALL
+Java_com_genmarecomp_android_GenmaActivity_nativeTouchPad(
+    JNIEnv* env, jclass, jint buttons, jbyteArray analog, jshort lx, jshort ly) {
+    std::lock_guard lock(g_loose_lock);
+    g_touch_pad = {};
+    g_touch_pad.connected = true;
+    g_touch_pad.buttons = uint16_t(buttons & 0xFFFF);
+    g_touch_pad.lx = int16_t(lx);
+    g_touch_pad.ly = int16_t(ly);
+    if (analog && env->GetArrayLength(analog) >= 8) {
+        jbyte tmp[8]{};
+        env->GetByteArrayRegion(analog, 0, 8, tmp);
+        for (int i = 0; i < 8; i++) g_touch_pad.analog[i] = uint8_t(tmp[i]);
+    }
+}
 
 // JNI callbacks from GenmaActivity.java for OEM virtualized controllers (Black-Android pattern).
 extern "C" JNIEXPORT void JNICALL

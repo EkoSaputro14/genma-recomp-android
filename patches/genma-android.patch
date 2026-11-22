@@ -180,20 +180,23 @@
              vkCmdCopyBufferToImage(cmd_, arena_, image.image, image.layout, 1, &c);
          }
      Layout(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-@@ -662,8 +745,11 @@
+@@ -662,8 +745,14 @@
          p->used = frame_;
          return p.get();
      }
 -    p = MakeImage(d.width, d.height, d.depth, d.levels, d.cube ? 6 : 1, FormatOf(Format(d.format).host), false, false);
 +    p = MakeImage(d.width, d.height, d.depth, d.levels, d.cube ? 6 : 1, FormatOf(Format(d.format).host, bc_supported_), false, false);
      p->desc = d;
-+    LOG_FIRST(16, "vulkan: tex fmt=0x%02X (%s) %ux%u lin=%d pal=%d comp=%d pitch=%u",
-+              d.format, Format(d.format).name, d.width, d.height, int(d.linear), int(colors != nullptr),
-+              int(Format(d.format).compressed), d.pitch);
++    if (static int tex_logged = 0; tex_logged < 24) {
++        tex_logged++;
++        LOGR("vulkan: tex#%d fmt=0x%02X (%s) %ux%u lin=%d pal=%d comp=%d pitch=%u data=0x%08X",
++             tex_logged, d.format, Format(d.format).name, d.width, d.height, int(d.linear),
++             int(colors != nullptr), int(Format(d.format).compressed), d.pitch, d.data);
++    }
      if (!colors)
          UploadImage(*p, d);
      else {
-@@ -813,6 +899,11 @@
+@@ -813,6 +902,11 @@
      auto it = shaders_.find(key);
      if (it != shaders_.end())
          return it->second;
@@ -205,7 +208,7 @@
      auto dir = app::CacheDir() / "shader-cache-vulkan";
      std::filesystem::create_directories(dir);
      std::string name = std::to_string(key);
-@@ -876,11 +967,12 @@
+@@ -876,11 +970,12 @@
      auto size = f.tellg();
      if (size <= 0 || size % 4)
          Fail("invalid SPIR-V file");
@@ -219,7 +222,7 @@
      VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
      ci.codeSize = words.size() * 4;
      ci.pCode = words.data();
-@@ -1439,16 +1531,55 @@
+@@ -1439,16 +1534,55 @@
          for (int i = 0; i < 256; i++)
              gamma_identity_ &= ramp[c * 256 + i] == i;
  }
@@ -276,7 +279,7 @@
      if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
          Fail("swapchain transfer destination unavailable");
      uint32_t n = 0;
-@@ -1468,15 +1599,24 @@
+@@ -1468,15 +1602,24 @@
          ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
      ci.imageFormat = choice.format;
      ci.imageColorSpace = choice.colorSpace;
@@ -302,7 +305,7 @@
      ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
      if (!(caps.supportedCompositeAlpha & ci.compositeAlpha))
          ci.compositeAlpha =
-@@ -1484,8 +1624,15 @@
+@@ -1484,8 +1627,15 @@
      ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
      ci.clipped = VK_TRUE;
      ci.oldSwapchain = swap_;
@@ -320,7 +323,7 @@
      if (swap_)
          vkDestroySwapchainKHR(device_, swap_, nullptr);
      swap_ = next;
-@@ -1494,7 +1641,8 @@
+@@ -1494,7 +1644,8 @@
      Check(vkGetSwapchainImagesKHR(device_, swap_, &n, nullptr), "swapchain images");
      swap_images_.resize(n);
      Check(vkGetSwapchainImagesKHR(device_, swap_, &n, swap_images_.data()), "swapchain images");
@@ -330,7 +333,7 @@
  }
  void Vulkan::Capture(Image &t) {
      auto dir = diag::CaptureDir();
-@@ -1511,6 +1659,18 @@
+@@ -1511,6 +1662,18 @@
      LOGR("vulkan: captured %s", file.c_str());
  }
  void Vulkan::Present(const Surface &front) {
@@ -349,7 +352,7 @@
      Image *t = Target(front, false);
      if (!t)
          Fail("present has no front surface");
-@@ -1524,6 +1684,14 @@
+@@ -1524,6 +1687,14 @@
      }
      uint32_t index = 0;
      VkResult result = vkAcquireNextImageKHR(device_, swap_, 30000000000ull, acquired_, VK_NULL_HANDLE, &index);
@@ -364,7 +367,7 @@
      if (result == VK_ERROR_OUT_OF_DATE_KHR) {
          extent_ = {};
          Resize();
-@@ -1584,6 +1752,12 @@
+@@ -1584,6 +1755,12 @@
      pi.pSwapchains = &swap_;
      pi.pImageIndices = &index;
      result = vkQueuePresentKHR(queue_, &pi);
