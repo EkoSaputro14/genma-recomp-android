@@ -17,7 +17,7 @@ Agar pemain di Android cukup memasang APK dan menyalin `.iso` tanpa perlu menjal
    - Unduh dan pasang APK dari **GitHub Releases**.
    - Ketuk **Izinkan Akses Storage** (*All Files Access* di Android 11+, atau *Storage* di Android 10).
    - Salin file `.iso` (atau ekstrak `default.xbe` + folder data game) ke `/storage/emulated/0/GenmaOnimusha`.
-   - Opsional: ekstrak HD Texture Pack ke `/storage/emulated/0/GenmaOnimusha/textures/` (cache RAM mobile: **512 MB**).
+   - Opsional: ekstrak HD Texture Pack ke `/storage/emulated/0/GenmaOnimusha/textures/` (cache RAM mobile: **1152 MB**).
 
 ## 2. Mode Build Lokal di PC (Opsional)
 ```bash

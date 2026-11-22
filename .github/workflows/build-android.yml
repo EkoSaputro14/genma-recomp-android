@@ -51,8 +51,15 @@ jobs:
 
       - name: Install Android NDK 27.2.12479018 & CMake 3.22.1
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [[ -z "$SDK_ROOT" || ! -d "$SDK_ROOT" ]]; then
+            echo "::error::ANDROID_HOME / ANDROID_SDK_ROOT tidak ditemukan pada runner."
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK_ROOT" >> $GITHUB_ENV
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
             "platforms;android-35" \
             "build-tools;35.0.0" \
             "ndk;27.2.12479018" \
@@ -65,31 +72,49 @@ jobs:
         run: |
           if [[ -f "ci/default.xbe.enc" && -n "$XBE_KEY" && -f "config/game.toml" && -d "sdk/tools/recomp" ]]; then
             echo "mode=standalone" >> $GITHUB_OUTPUT
-            mkdir -p assets generated/game android/app/src/main/jniLibs/arm64-v8a
+            mkdir -p assets generated/game build-arm64-obj android/app/src/main/jniLibs/arm64-v8a
             key_file="$RUNNER_TEMP/xbe.key"
             printf '%s' "$XBE_KEY" > "$key_file"
-            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-              -in ci/default.xbe.enc -out assets/default.xbe -pass "file:$key_file"
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+              -in ci/default.xbe.enc -out assets/default.xbe -pass "file:$key_file"; then
+              rm -f "$key_file"
+              echo "::error::Gagal mendekripsi ci/default.xbe.enc. Pastikan nilai GitHub Secret XBE_KEY sama persis dengan kata sandi saat enkripsi."
+              exit 1
+            fi
             rm -f "$key_file"
             sha1sum assets/default.xbe
 
-            sudo apt-get update && sudo apt-get install -y clang ninja-build
+            sudo apt-get update && sudo apt-get install -y clang make ninja-build lld
             cmake --preset linux-core
             cmake --build --preset linux-core --target xbe_recomp xbe_symbols --parallel "$(nproc)"
-            ./out/build/linux-core/xbe_recomp config/game.toml --xbe assets/default.xbe --out generated/game
+            ./out/build/linux-core/xbe_recomp config/game.toml --xdk sdk/xdk
 
             TOOLCHAIN="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++"
-            "$TOOLCHAIN" -shared -fPIC -std=c++20 -O3 \
-              -Isdk/runtime -Isrc/game \
-              generated/game/*.cpp \
-              src/game/modern_controls.cpp \
-              src/game/background_streaming.cpp \
-              src/game/math_flags.cpp \
+            export TOOLCHAIN
+            compile_unit() {
+              local src="$1"
+              local obj="build-arm64-obj/$(echo "$src" | tr '/.' '__').o"
+              "$TOOLCHAIN" -c -fPIC -std=c++20 -O2 -fno-strict-aliasing \
+                -Wno-unused-label -Wno-parentheses-equality -Wno-unused-variable -Wno-unused-function \
+                -Igenerated/game -Isdk/runtime -Isrc -Isrc/game \
+                "$src" -o "$obj"
+            }
+            export -f compile_unit
+
+            SRCS=(generated/game/*.cpp)
+            for extra in src/game/modern_controls.cpp src/game/background_streaming.cpp src/game/math_flags.cpp; do
+              if [[ -f "$extra" ]]; then
+                SRCS+=("$extra")
+              fi
+            done
+
+            printf '%s\n' "${SRCS[@]}" | xargs -P "$(nproc)" -I{} bash -c 'compile_unit "$1"' _ {}
+            "$TOOLCHAIN" -shared -Wl,--allow-shlib-undefined build-arm64-obj/*.o \
               -o android/app/src/main/jniLibs/arm64-v8a/libgenma_game.so
             ls -lh android/app/src/main/jniLibs/arm64-v8a/libgenma_game.so
           else
             echo "mode=asset-free-runtime" >> $GITHUB_OUTPUT
-            echo "::notice::ci/default.xbe.enc atau secret XBE_KEY tidak ditemukan; membangun APK Runtime Asset-Free."
+            echo "::notice::ci/default.xbe.enc atau secret XBE_KEY (atau source upstream sdk/tools/recomp) tidak ditemukan; membangun APK Runtime Asset-Free."
           fi
 
       - name: Prepare APK Signing Keystore
@@ -168,7 +193,7 @@ jobs:
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`
             - **Grafis**: Vulkan 1.0+ Fallback (Adreno/Mali) + SPIR-V pra-kompilasi
             - **Folder Data di HP**: `/storage/emulated/0/GenmaOnimusha` (salin `.iso` atau ekstrak `default.xbe` beserta folder game, dan opsional `textures/` untuk HD Texture Pack)
-            - **Kontrol & UI**: Gamepad Bluetooth/USB-C + Overlay sentuh virtual + Menu ImGui ramah sentuh (1.45x DPI)
+            - **Kontrol & UI**: Gamepad Bluetooth/USB-C + Overlay sentuh virtual + Menu ImGui ramah sentuh (1.55x DPI)
 
             > Untuk mode **Standalone APK tanpa PC di HP** (seperti `Black-Android`), enkripsi `default.xbe` legal Anda menjadi `ci/default.xbe.enc` memakai `tools/encrypt_xbe_for_ci.sh` dan simpan kata sandinya di GitHub Secret `XBE_KEY` (disarankan pada repositori *private*).
           files: |

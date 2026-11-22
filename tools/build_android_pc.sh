@@ -29,20 +29,32 @@ echo "==> 1/4 Membangun xbe_recomp & xbe_symbols native di host PC..."
 cmake --preset linux-core
 cmake --build --preset linux-core --target xbe_recomp xbe_symbols --parallel "$(nproc)"
 
-echo "==> 2/4 Merekompilasi default.xbe menjadi 32 partisi C++20..."
-mkdir -p generated/game
-./out/build/linux-core/xbe_recomp config/game.toml --xbe "$XBE_PATH" --out generated/game
+echo "==> 2/4 Merekompilasi default.xbe menjadi partisi C++20..."
+mkdir -p assets generated/game
+if [[ "$(realpath "$XBE_PATH")" != "$(realpath assets/default.xbe 2>/dev/null || echo assets/default.xbe)" ]]; then
+  cp "$XBE_PATH" assets/default.xbe
+fi
+./out/build/linux-core/xbe_recomp config/game.toml --xdk sdk/xdk
 
 echo "==> 3/4 Cross-compiling libgenma_game.so untuk arm64-v8a (API 29)..."
 TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++"
-mkdir -p android/app/src/main/jniLibs/arm64-v8a
+mkdir -p build-arm64-obj android/app/src/main/jniLibs/arm64-v8a
 
-$TOOLCHAIN -shared -fPIC -std=c++20 -O3 \
-  -Isdk/runtime -Isrc/game \
-  generated/game/*.cpp \
-  src/game/modern_controls.cpp \
-  src/game/background_streaming.cpp \
-  src/game/math_flags.cpp \
+compile_unit() {
+  local src="$1"
+  local obj="build-arm64-obj/$(echo "$src" | tr '/.' '__').o"
+  "$TOOLCHAIN" -c -fPIC -std=c++20 -O2 -fno-strict-aliasing \
+    -Wno-unused-label -Wno-parentheses-equality -Wno-unused-variable -Wno-unused-function \
+    -Igenerated/game -Isdk/runtime -Isrc -Isrc/game \
+    "$src" -o "$obj"
+}
+export TOOLCHAIN
+export -f compile_unit
+
+printf '%s\n' generated/game/*.cpp src/game/modern_controls.cpp src/game/background_streaming.cpp src/game/math_flags.cpp \
+  | xargs -P "$(nproc)" -I{} bash -c 'compile_unit "$1"' _ {}
+
+"$TOOLCHAIN" -shared -Wl,--allow-shlib-undefined build-arm64-obj/*.o \
   -o android/app/src/main/jniLibs/arm64-v8a/libgenma_game.so
 
 echo "==> 4/4 Mengemas APK ARM64 dengan Gradle..."

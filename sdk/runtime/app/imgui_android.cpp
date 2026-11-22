@@ -5,7 +5,7 @@
 namespace app_android {
 
 struct TouchMenuSettings {
-    float dpiScale = 1.45f;
+    float dpiScale = 1.55f;
     float minTouchTargetPx = 48.0f;
     bool open = false;
 

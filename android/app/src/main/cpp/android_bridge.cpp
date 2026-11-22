@@ -5,6 +5,7 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_android.h>
 #include <string>
+#include <vector>
 
 #include "xdk/fiber_android.h"
 #include "cpu/arm64_compat.h"
@@ -26,11 +27,7 @@ bool IsTouchMenuOpen();
 }
 
 namespace gpu_android {
-class MobileHdTextureCache {
-public:
-    void SetRootDirectory(const std::string& path);
-};
-MobileHdTextureCache& GetMobileTextureCache();
+void SetMobileTextureRootDirectory(const std::string& path);
 }
 
 namespace {
@@ -132,7 +129,7 @@ Java_com_genmarecomp_android_GenmaActivity_nativeRunSelfCheck(JNIEnv* env, jobje
         "Vulkan GPU: " + g_gpuName + " (v" + std::to_string(vkMajor) + "." + std::to_string(vkMinor) + ")\n"
         "Bundled Game Core (libgenma_game.so): " + std::string(g_gameLibLoaded ? "TERBUNDEL (SIAP)" : "BELUM TERBUNDEL") + "\n"
         "Folder Data Game: " + g_gameDataPath + "\n"
-        "Folder HD Textures: " + g_texturePackPath + " (Cache 512 MB)\n"
+        "Folder HD Textures: " + g_texturePackPath + " (Cache 1152 MB)\n"
         "ARM64 Timer Ticks: " + std::to_string(ticks) + "\n"
         "Status: " + g_lastStatus;
 
@@ -154,7 +151,7 @@ Java_com_genmarecomp_android_GenmaActivity_nativeSetGamePaths(
         const char* t = env->GetStringUTFChars(texDir, nullptr);
         if (t) {
             g_texturePackPath = t;
-            gpu_android::GetMobileTextureCache().SetRootDirectory(g_texturePackPath);
+            gpu_android::SetMobileTextureRootDirectory(g_texturePackPath);
             env->ReleaseStringUTFChars(texDir, t);
         }
     }
