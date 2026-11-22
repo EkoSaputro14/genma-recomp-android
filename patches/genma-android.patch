@@ -1,0 +1,246 @@
+--- a/sdk/runtime/xdk/fiber.cpp
++++ b/sdk/runtime/xdk/fiber.cpp
+@@ -14,6 +14,8 @@
+ #ifdef _WIN32
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
++#elif defined(__ANDROID__)
++#include "xdk/fiber_android.h"
+ #else
+ #include "xdk/fiber_linux.h"
+ #endif
+--- a/sdk/runtime/gpu/vulkan.cpp
++++ b/sdk/runtime/gpu/vulkan.cpp
+@@ -12,8 +12,10 @@
+ #include <fcntl.h>
+ #include <map>
+ #include <memory>
++#ifndef __ANDROID__
+ #include <spawn.h>
+ #include <sys/wait.h>
++#endif
+ #include <unistd.h>
+ #include <vector>
+ #include "app/app.h"
+@@ -23,6 +25,10 @@
+ #include "gpu/texture.h"
+ #include "gpu/vertex.h"
+ #include "kernel/kernel.h"
++#ifdef __ANDROID__
++#include "host.h"
++#include "vk_shader.h"
++#endif
+ extern char **environ;
+ namespace app {
+ Mode LinuxWindowSize();
+@@ -136,16 +142,16 @@
+         return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+     }
+ }
+-VkFormat FormatOf(Host h) {
++VkFormat FormatOf(Host h, bool bc_supported = true) {
+     switch (h) {
+     case Host::BGRA8:
+         return VK_FORMAT_B8G8R8A8_UNORM;
+     case Host::BC1:
+-        return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
++        return bc_supported ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK : VK_FORMAT_B8G8R8A8_UNORM;
+     case Host::BC2:
+-        return VK_FORMAT_BC2_UNORM_BLOCK;
++        return bc_supported ? VK_FORMAT_BC2_UNORM_BLOCK : VK_FORMAT_B8G8R8A8_UNORM;
+     case Host::BC3:
+-        return VK_FORMAT_BC3_UNORM_BLOCK;
++        return bc_supported ? VK_FORMAT_BC3_UNORM_BLOCK : VK_FORMAT_B8G8R8A8_UNORM;
+     case Host::R32F:
+         return VK_FORMAT_R32_SFLOAT;
+     case Host::R16Unorm:
+@@ -208,6 +214,10 @@
+     uint64_t query_sum_ = 0, frame_ = 0, draws_ = 0;
+     uint8_t gamma_[768]{};
+     bool gamma_identity_ = true;
++    bool bc_supported_ = true;
++#ifdef __ANDROID__
++    uint32_t surface_epoch_ = 0;
++#endif
+     uint32_t MemoryType(uint32_t allowed, VkMemoryPropertyFlags flags);
+     void Begin();
+     void Submit(VkSemaphore wait = VK_NULL_HANDLE);
+@@ -308,13 +318,19 @@
+     vkGetPhysicalDeviceMemoryProperties(physical_, &memory_);
+     VkPhysicalDeviceFeatures features{};
+     vkGetPhysicalDeviceFeatures(physical_, &features);
+-    if (!features.textureCompressionBC)
+-        Fail("BC textures unavailable");
++    bc_supported_ = features.textureCompressionBC == VK_TRUE;
++    if (!bc_supported_) {
++        LOGR("vulkan: BC textures unavailable; enabling CPU DXT1/3/5 decode fallback");
++    }
+     VkPhysicalDeviceFeatures enable{};
+-    enable.textureCompressionBC = VK_TRUE;
++    enable.textureCompressionBC = bc_supported_ ? VK_TRUE : VK_FALSE;
+     enable.independentBlend = features.independentBlend;
+     enable.fillModeNonSolid = features.fillModeNonSolid;
+     enable.occlusionQueryPrecise = features.occlusionQueryPrecise;
++#ifdef __ANDROID__
++    vkshader::Init(app::CacheDir() / "shader-cache-vulkan");
++    surface_epoch_ = host::SurfaceEpoch();
++#endif
+     float priority = 1;
+     VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+     qi.queueFamilyIndex = family_;
+@@ -525,8 +541,68 @@
+                          nullptr, 1, &b);
+     t.layout = layout;
+ }
++void Rgb565(uint16_t c, uint8_t *bgr) {
++    bgr[2] = uint8_t((c >> 11) * 255 / 31);
++    bgr[1] = uint8_t(((c >> 5) & 63) * 255 / 63);
++    bgr[0] = uint8_t((c & 31) * 255 / 31);
++}
++void ColourBlock(const uint8_t *b, bool dxt1, uint8_t *out) {
++    uint16_t c0 = uint16_t(b[0] | (b[1] << 8)), c1 = uint16_t(b[2] | (b[3] << 8));
++    uint8_t pal[4][4] = {};
++    Rgb565(c0, pal[0]);
++    Rgb565(c1, pal[1]);
++    for (int i = 0; i < 4; i++) pal[i][3] = 255;
++    for (int k = 0; k < 3; k++) {
++        if (c0 > c1 || !dxt1) {
++            pal[2][k] = uint8_t((2 * pal[0][k] + pal[1][k]) / 3);
++            pal[3][k] = uint8_t((pal[0][k] + 2 * pal[1][k]) / 3);
++        } else {
++            pal[2][k] = uint8_t((pal[0][k] + pal[1][k]) / 2);
++            pal[3][k] = 0;
++        }
++    }
++    if (dxt1 && c0 <= c1) pal[3][3] = 0;
++    uint32_t bits = uint32_t(b[4] | (b[5] << 8) | (b[6] << 16) | (uint32_t(b[7]) << 24));
++    for (int i = 0; i < 16; i++) std::memcpy(out + i * 4, pal[(bits >> (i * 2)) & 3], 4);
++}
++void DecodeDxtCpu(Host host, const std::vector<uint8_t> &in, uint32_t row_pitch, uint32_t w, uint32_t h, uint32_t z,
++                  std::vector<uint8_t> &out) {
++    uint32_t block = host == Host::BC1 ? 8 : 16;
++    uint32_t bw = std::max(1u, (w + 3) / 4), bh = std::max(1u, (h + 3) / 4);
++    if (!row_pitch) row_pitch = bw * block;
++    out.assign(size_t(w) * h * z * 4, 0);
++    uint8_t px[64];
++    for (uint32_t s = 0; s < z; s++)
++        for (uint32_t by = 0; by < bh; by++)
++            for (uint32_t bx = 0; bx < bw; bx++) {
++                size_t at = (size_t(s) * bh + by) * row_pitch + size_t(bx) * block;
++                if (at + block > in.size()) continue;
++                const uint8_t *b = &in[at];
++                ColourBlock(host == Host::BC1 ? b : b + 8, host == Host::BC1, px);
++                if (host == Host::BC2) {
++                    for (int i = 0; i < 16; i++) px[i * 4 + 3] = uint8_t(((b[i / 2] >> ((i & 1) * 4)) & 15) * 17);
++                } else if (host == Host::BC3) {
++                    uint8_t a[8] = {b[0], b[1]};
++                    if (a[0] > a[1]) {
++                        for (int i = 1; i < 7; i++) a[i + 1] = uint8_t(((7 - i) * a[0] + i * a[1]) / 7);
++                    } else {
++                        for (int i = 1; i < 5; i++) a[i + 1] = uint8_t(((5 - i) * a[0] + i * a[1]) / 5);
++                        a[6] = 0;
++                        a[7] = 255;
++                    }
++                    uint64_t bits = 0;
++                    for (int i = 0; i < 6; i++) bits |= uint64_t(b[2 + i]) << (8 * i);
++                    for (int i = 0; i < 16; i++) px[i * 4 + 3] = a[(bits >> (3 * i)) & 7];
++                }
++                for (uint32_t y = 0; y < 4 && by * 4 + y < h; y++)
++                    for (uint32_t x = 0; x < 4 && bx * 4 + x < w; x++)
++                        std::memcpy(&out[((size_t(s) * h + by * 4 + y) * w + bx * 4 + x) * 4], px + (y * 4 + x) * 4, 4);
++            }
++}
+ void Vulkan::UploadImage(Image &image, const TextureDesc &d) {
+     const uint8_t *guest = static_cast<const uint8_t *>(kernel::HostPtr(d.data));
++    const Host host_fmt = Format(d.format).host;
++    const bool decode_dxt = !bc_supported_ && (host_fmt == Host::BC1 || host_fmt == Host::BC2 || host_fmt == Host::BC3);
+     Layout(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     for (uint32_t face = 0; face < image.layers; face++)
+         for (uint32_t level = 0; level < d.levels; level++) {
+@@ -535,12 +611,17 @@
+             DecodeLevel(d, level, face, guest, nullptr, pixels, pitch);
+             if (pixels.empty())
+                 Fail("texture decode failed");
+-            auto off = Upload(pixels.data(), pixels.size(), 16);
++            uint32_t lw = std::max(d.width >> level, 1u);
++            uint32_t lh = std::max(d.height >> level, 1u);
++            uint32_t lz = std::max(d.depth >> level, 1u);
++            std::vector<uint8_t> decoded_bgra;
++            const std::vector<uint8_t> &src =
++                decode_dxt ? (DecodeDxtCpu(host_fmt, pixels, pitch, lw, lh, lz, decoded_bgra), decoded_bgra) : pixels;
++            auto off = Upload(src.data(), src.size(), 16);
+             VkBufferImageCopy c{};
+             c.bufferOffset = off;
+             c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, face, 1};
+-            c.imageExtent = {std::max(d.width >> level, 1u), std::max(d.height >> level, 1u),
+-                             std::max(d.depth >> level, 1u)};
++            c.imageExtent = {lw, lh, lz};
+             vkCmdCopyBufferToImage(cmd_, arena_, image.image, image.layout, 1, &c);
+         }
+     Layout(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+@@ -662,7 +743,7 @@
+         p->used = frame_;
+         return p.get();
+     }
+-    p = MakeImage(d.width, d.height, d.depth, d.levels, d.cube ? 6 : 1, FormatOf(Format(d.format).host), false, false);
++    p = MakeImage(d.width, d.height, d.depth, d.levels, d.cube ? 6 : 1, FormatOf(Format(d.format).host, bc_supported_), false, false);
+     p->desc = d;
+     if (!colors)
+         UploadImage(*p, d);
+@@ -813,6 +894,11 @@
+     auto it = shaders_.find(key);
+     if (it != shaders_.end())
+         return it->second;
++    std::vector<uint32_t> words;
++#ifdef __ANDROID__
++    if (!vkshader::Compile(source, "main", vertex ? vkshader::Stage::Vertex : vkshader::Stage::Pixel, key, words))
++        Fail("Android glslang shader compilation failed");
++#else
+     auto dir = app::CacheDir() / "shader-cache-vulkan";
+     std::filesystem::create_directories(dir);
+     std::string name = std::to_string(key);
+@@ -876,11 +962,12 @@
+     auto size = f.tellg();
+     if (size <= 0 || size % 4)
+         Fail("invalid SPIR-V file");
+-    std::vector<uint32_t> words(size_t(size) / 4);
++    words.resize(size_t(size) / 4);
+     f.seekg(0);
+     f.read(reinterpret_cast<char *>(words.data()), size);
+     if (!f)
+         Fail("cannot read SPIR-V");
++#endif
+     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+     ci.codeSize = words.size() * 4;
+     ci.pCode = words.data();
+@@ -1511,6 +1598,30 @@
+     LOGR("vulkan: captured %s", file.c_str());
+ }
+ void Vulkan::Present(const Surface &front) {
++#ifdef __ANDROID__
++    if (!host::Foreground()) {
++        Submit();
++        host::WaitForeground();
++    }
++    const uint32_t epoch = host::SurfaceEpoch();
++    if (epoch != surface_epoch_) {
++        Submit();
++        Check(vkQueueWaitIdle(queue_), "surface epoch idle");
++        if (swap_) {
++            vkDestroySwapchainKHR(device_, swap_, nullptr);
++            swap_ = VK_NULL_HANDLE;
++            swap_images_.clear();
++        }
++        if (surface_) {
++            vkDestroySurfaceKHR(instance_, surface_, nullptr);
++            surface_ = VK_NULL_HANDLE;
++        }
++        if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window *>(app::Window()), instance_, nullptr, &surface_))
++            Fail(SDL_GetError());
++        extent_ = {};
++        surface_epoch_ = epoch;
++    }
++#endif
+     Image *t = Target(front, false);
+     if (!t)
+         Fail("present has no front surface");

@@ -4,39 +4,41 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Tag versi rilis Android (contoh: v0.7.0-android.1)'
+        description: 'Tag versi rilis Android (contoh: v0.8.0-android.1)'
         required: true
-        default: 'v0.7.0-android.1'
+        default: 'v0.8.0-android.1'
         type: string
       publish_release:
         description: 'Publikasikan langsung ke GitHub Releases'
         required: true
         default: 'true'
         type: string
-      vulkan_mode:
-        description: 'Mode Vulkan target'
-        required: false
-        default: '1.0-fallback'
-        type: string
-      min_sdk:
-        description: 'Android minSdk'
-        required: false
-        default: '29'
-        type: string
   push:
+    branches:
+      - main
     tags:
       - 'v*-android*'
 
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-android-apk:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync Pinned Upstream rafaelkenedy/genma-recomp & Apply Android Patch
+        run: |
+          bash tools/sync_upstream.sh
 
       - name: Setup JDK 17
         uses: actions/setup-java@v4
@@ -56,7 +58,7 @@ jobs:
             echo "::error::ANDROID_HOME / ANDROID_SDK_ROOT tidak ditemukan pada runner."
             exit 1
           fi
-          echo "ANDROID_HOME=$SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
           "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
@@ -65,138 +67,112 @@ jobs:
             "ndk;27.2.12479018" \
             "cmake;3.22.1"
 
-      - name: Recompile Encrypted default.xbe on CI (Black-Android Standalone Mode)
+      - name: Decrypt default.xbe & Recompile to C++20 (Black-Android Standalone Mode)
         id: recomp
         env:
           XBE_KEY: ${{ secrets.XBE_KEY }}
         run: |
-          if [[ -f "ci/default.xbe.enc" && -n "$XBE_KEY" && -f "config/game.toml" && -d "sdk/tools/recomp" ]]; then
-            echo "mode=standalone" >> $GITHUB_OUTPUT
-            mkdir -p assets generated/game build-arm64-obj android/app/src/main/jniLibs/arm64-v8a
-            key_file="$RUNNER_TEMP/xbe.key"
-            printf '%s' "$XBE_KEY" > "$key_file"
-            if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-              -in ci/default.xbe.enc -out assets/default.xbe -pass "file:$key_file"; then
-              rm -f "$key_file"
-              echo "::error::Gagal mendekripsi ci/default.xbe.enc. Pastikan nilai GitHub Secret XBE_KEY sama persis dengan kata sandi saat enkripsi."
-              exit 1
-            fi
-            rm -f "$key_file"
-            sha1sum assets/default.xbe
+          if [[ ! -f "ci/default.xbe.enc" ]]; then
+            echo "::error::ci/default.xbe.enc tidak ditemukan."
+            exit 1
+          fi
+          if [[ -z "$XBE_KEY" ]]; then
+            echo "::error::GitHub Actions Secret XBE_KEY belum diset."
+            exit 1
+          fi
+          mkdir -p assets generated/game
+          key_file="$RUNNER_TEMP/xbe.key"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s' "$XBE_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in ci/default.xbe.enc -out assets/default.xbe -pass "file:$key_file"; then
+            echo "::error::Gagal mendekripsi ci/default.xbe.enc. Pastikan nilai Secret XBE_KEY cocok."
+            exit 1
+          fi
+          rm -f "$key_file"
+          sha1sum assets/default.xbe
 
-            sudo apt-get update && sudo apt-get install -y clang make ninja-build lld
-            cmake --preset linux-core
-            cmake --build --preset linux-core --target xbe_recomp xbe_symbols --parallel "$(nproc)"
-            ./out/build/linux-core/xbe_recomp config/game.toml --xdk sdk/xdk
+          sudo apt-get update && sudo apt-get install -y clang make ninja-build lld
+          cmake --preset linux-core
+          cmake --build --preset linux-core --target xbe_recomp xbe_symbols --parallel "$(nproc)"
+          ./out/build/linux-core/xbe_recomp config/game.toml --xdk sdk/xdk
+          ls -la generated/game/x86_func_mapping.cpp generated/game/image_symbols.h
+          echo "mode=standalone-libmain" >> "$GITHUB_OUTPUT"
 
-            TOOLCHAIN="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++"
-            export TOOLCHAIN
-            compile_unit() {
-              local src="$1"
-              local obj="build-arm64-obj/$(echo "$src" | tr '/.' '__').o"
-              "$TOOLCHAIN" -c -fPIC -std=c++20 -O2 -fno-strict-aliasing \
-                -Wno-unused-label -Wno-parentheses-equality -Wno-unused-variable -Wno-unused-function \
-                -Igenerated/game -Isdk/runtime -Isrc -Isrc/game \
-                "$src" -o "$obj"
-            }
-            export -f compile_unit
-
-            SRCS=(generated/game/*.cpp)
-            for extra in src/game/modern_controls.cpp src/game/background_streaming.cpp src/game/math_flags.cpp; do
-              if [[ -f "$extra" ]]; then
-                SRCS+=("$extra")
-              fi
-            done
-
-            printf '%s\n' "${SRCS[@]}" | xargs -P "$(nproc)" -I{} bash -c 'compile_unit "$1"' _ {}
-            "$TOOLCHAIN" -shared -Wl,--allow-shlib-undefined build-arm64-obj/*.o \
-              -o android/app/src/main/jniLibs/arm64-v8a/libgenma_game.so
-            ls -lh android/app/src/main/jniLibs/arm64-v8a/libgenma_game.so
+      - name: Prepare APK Release Keystore (Optional)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
+        run: |
+          if [[ -n "$ANDROID_KEYSTORE_BASE64" ]]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            {
+              echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks"
+              echo "ANDROID_KEYSTORE_PASS=$ANDROID_KEYSTORE_PASS"
+              echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS"
+              echo "ANDROID_KEY_PASS=$ANDROID_KEY_PASS"
+            } >> "$GITHUB_ENV"
           else
-            echo "mode=asset-free-runtime" >> $GITHUB_OUTPUT
-            echo "::notice::ci/default.xbe.enc atau secret XBE_KEY (atau source upstream sdk/tools/recomp) tidak ditemukan; membangun APK Runtime Asset-Free."
+            echo "::warning::ANDROID_KEYSTORE_BASE64 tidak diset; APK akan menggunakan debug keystore Android."
           fi
 
-      - name: Prepare APK Signing Keystore
-        run: |
-          mkdir -p /tmp/signing
-          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
-            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > /tmp/signing/release.jks
-            echo "ANDROID_KEYSTORE_PASS=${{ secrets.ANDROID_KEYSTORE_PASS }}" >> $GITHUB_ENV
-            echo "ANDROID_KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}" >> $GITHUB_ENV
-            echo "ANDROID_KEY_PASS=${{ secrets.ANDROID_KEY_PASS }}" >> $GITHUB_ENV
-          else
-            keytool -genkeypair -v \
-              -keystore /tmp/signing/release.jks \
-              -storepass genmarecomp \
-              -keypass genmarecomp \
-              -alias genma \
-              -keyalg RSA -keysize 2048 -validity 3650 \
-              -dname "CN=Genma Recomp Android, OU=Community Port, O=GenmaRecomp, L=ID, C=ID"
-            echo "ANDROID_KEYSTORE_PASS=genmarecomp" >> $GITHUB_ENV
-            echo "ANDROID_KEY_ALIAS=genma" >> $GITHUB_ENV
-            echo "ANDROID_KEY_PASS=genmarecomp" >> $GITHUB_ENV
-          fi
-          echo "ANDROID_KEYSTORE_PATH=/tmp/signing/release.jks" >> $GITHUB_ENV
-
-      - name: Build Signed Android ARM64 APK
-        working-directory: android
-        run: |
-          gradle assembleRelease --stacktrace --no-daemon
-
-      - name: Package Release Assets & SHA-256 Checksums
-        id: pkg
+      - name: Resolve Version
+        id: ver
         run: |
           VERSION="${{ inputs.release_version || github.ref_name }}"
-          if [[ -z "$VERSION" || "$VERSION" == "android-port" || "$VERSION" == "main" ]]; then
-            VERSION="v0.7.0-android.1"
+          if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
+            VERSION="v0.8.0-android.${{ github.run_number }}"
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          CLEAN_NAME="${VERSION#v}"
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "name=$CLEAN_NAME" >> "$GITHUB_OUTPUT"
 
+      - name: Build Android ARM64 APK (SDL3 + Vulkan + libmain.so)
+        working-directory: android
+        run: |
+          gradle assembleRelease \
+            -PversionCode=${{ github.run_number }} \
+            -PversionName=${{ steps.ver.outputs.name }} \
+            --stacktrace --no-daemon
+
+      - name: Package Release Assets & SHA-256 Checksums
+        run: |
           mkdir -p release-dist
           APK_SRC=$(find android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
-          APK_OUT="release-dist/GenmaOnimusha-${VERSION}-android-arm64-v8a.apk"
+          APK_OUT="release-dist/GenmaOnimusha-${{ steps.ver.outputs.tag }}-android-arm64-v8a.apk"
           cp "$APK_SRC" "$APK_OUT"
-
-          tar -czf "release-dist/GenmaOnimusha-${VERSION}-pc-android-builder.tar.gz" \
-            tools/build_android_pc.sh \
-            tools/encrypt_xbe_for_ci.sh \
-            docs/android-port-guide.md \
-            sdk/runtime/xdk/fiber_android.h \
-            sdk/runtime/kernel/memory_android.cpp \
-            sdk/runtime/cpu/arm64_compat.h \
-            sdk/runtime/gpu/vulkan_android.h \
-            sdk/runtime/core/touch_overlay.h \
-            sdk/runtime/core/touch_overlay.cpp
-
           (cd release-dist && sha256sum * > SHA256SUMS)
           ls -lh release-dist
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: genma-android-arm64-apk
+          name: genma-android-arm64-apk-${{ steps.ver.outputs.tag }}
           path: release-dist/*
+          if-no-files-found: error
 
       - name: Publish GitHub Release
         if: ${{ (inputs.publish_release == 'true') || startsWith(github.ref, 'refs/tags/v') }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.pkg.outputs.version }}
-          name: "Genma Onimusha Android ARM64 ${{ steps.pkg.outputs.version }}"
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: "Genma Onimusha Android ARM64 ${{ steps.ver.outputs.tag }}"
           prerelease: true
           generate_release_notes: true
           body: |
-            ### Genma Onimusha — Android ARM64 Port (${{ steps.pkg.outputs.version }})
+            ### Genma Onimusha — Android ARM64 Port (${{ steps.ver.outputs.tag }})
 
-            - **Mode Build CI**: `${{ steps.recomp.outputs.mode }}`
-            - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`
-            - **Grafis**: Vulkan 1.0+ Fallback (Adreno/Mali) + SPIR-V pra-kompilasi
-            - **Folder Data di HP**: `/storage/emulated/0/GenmaOnimusha` (salin `.iso` atau ekstrak `default.xbe` beserta folder game, dan opsional `textures/` untuk HD Texture Pack)
-            - **Kontrol & UI**: Gamepad Bluetooth/USB-C + Overlay sentuh virtual + Menu ImGui ramah sentuh (1.45x DPI)
-
-            > Untuk mode **Standalone APK tanpa PC di HP** (seperti `Black-Android`), enkripsi `default.xbe` legal Anda menjadi `ci/default.xbe.enc` memakai `tools/encrypt_xbe_for_ci.sh` dan simpan kata sandinya di GitHub Secret `XBE_KEY` (disarankan pada repositori *private*).
+            - **Arsitektur**: Port native ARM64 (`libSDL3.so` + `libmain.so`) dari `rafaelkenedy/genma-recomp` menggunakan pola *game loader* `RanggaCasper/Black-Android`
+            - **Mode Build CI**: `${{ steps.recomp.outputs.mode }}` (32 partisi XBE terkompilasi + Vulkan + glslang in-process + CPU DXT1/3/5 fallback)
+            - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`, 16 KB page-aligned
+            - **Cara Memuat Game di HP**:
+              1. Pasang APK dan buka **Genma Onimusha**.
+              2. Izinkan **All Files Access** (Android 11+) atau **Storage** (Android 10), **atau** langsung ketuk **Import game** untuk memilih `.iso` dari Downloads / USB / Cloud.
+              3. Alternatif manual: salin file `.iso` (Genma Onimusha USA) atau `default.xbe` + folder data ke `/storage/emulated/0/GenmaOnimusha` (atau folder `GenmaOnimusha` di SD Card, atau `Android/data/com.genmarecomp.android/files/assets`).
+              4. Game akan terdeteksi dan langsung *boot* otomatis.
           files: |
             release-dist/*.apk
-            release-dist/*.tar.gz
             release-dist/SHA256SUMS

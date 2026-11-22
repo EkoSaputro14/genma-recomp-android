@@ -116,6 +116,8 @@ extern "C" __attribute__((weak, used, noinline, noreturn)) void genma_arm64_tram
 
 extern "C" __attribute__((weak, naked, noinline)) void genma_arm64_trampoline() {
     __asm__ volatile(
+        // BTI landing pad for ARMv8.5+ Android devices; NOP on older cores
+        "hint #34\n"
         // Host* was preloaded into x19 when constructing the fiber context
         "mov x0, x19\n"
         "mov x29, #0\n"
@@ -192,5 +194,9 @@ inline void SwitchToFiber(void* value) {
 }
 
 inline void DeleteFiber(void* value) {
-    delete static_cast<android_fiber::Host*>(value);
+    auto* host = static_cast<android_fiber::Host*>(value);
+    if (!host || host == &android_fiber::root || host == android_fiber::current) {
+        return;
+    }
+    delete host;
 }

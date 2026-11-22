@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Enkripsi default.xbe untuk build Standalone APK otomatis di GitHub Actions (pola Black-Android)
 # Penggunaan:
-#   XBE_KEY="kata-sandi-kuat-anda" ./tools/encrypt_xbe_for_ci.sh /path/to/default.xbe
+#   XBE_KEY="kata-sandi-kuat-anda" bash tools/encrypt_xbe_for_ci.sh /path/to/default.xbe
 # Lalu tambahkan secret GitHub bernama XBE_KEY dengan nilai yang sama di Settings -> Secrets -> Actions.
 
 XBE_INPUT="${1:-assets/default.xbe}"
@@ -18,12 +18,15 @@ if [[ -z "${XBE_KEY:-}" ]]; then
 fi
 
 mkdir -p ci
-printf '%s' "$XBE_KEY" > /tmp/genma_xbe.key
+key_file=$(mktemp)
+trap 'rm -f "$key_file"' EXIT
+chmod 600 "$key_file"
+printf '%s' "$XBE_KEY" > "$key_file"
+
 openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
   -in "$XBE_INPUT" \
   -out ci/default.xbe.enc \
-  -pass file:/tmp/genma_xbe.key
-rm -f /tmp/genma_xbe.key
+  -pass "file:$key_file"
 
 echo "[OK] Terenkripsi di ci/default.xbe.enc"
 echo "Commit ci/default.xbe.enc ke repo (disarankan repo private) dan simpan XBE_KEY di GitHub Actions Secrets."

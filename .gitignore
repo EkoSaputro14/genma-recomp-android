@@ -1,0 +1,21 @@
+# User game files and recompiler outputs
+assets/
+iso/
+generated/
+out/
+build*/
+release-dist/
+
+# Cloned third-party SDL3 (fetched by Gradle fetchSDL task)
+third_party/
+
+# Android / Gradle build outputs
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+*.apk
+*.aab
+*.jks
+*.keystore
