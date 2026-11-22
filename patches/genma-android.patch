@@ -54,18 +54,20 @@
      case Host::R32F:
          return VK_FORMAT_R32_SFLOAT;
      case Host::R16Unorm:
-@@ -208,6 +214,10 @@
+@@ -208,6 +214,12 @@
      uint64_t query_sum_ = 0, frame_ = 0, draws_ = 0;
      uint8_t gamma_[768]{};
      bool gamma_identity_ = true;
 +    bool bc_supported_ = true;
 +#ifdef __ANDROID__
 +    uint32_t surface_epoch_ = 0;
++    bool surface_lost_ = false;
++    bool RecreateSurface();
 +#endif
      uint32_t MemoryType(uint32_t allowed, VkMemoryPropertyFlags flags);
      void Begin();
      void Submit(VkSemaphore wait = VK_NULL_HANDLE);
-@@ -308,13 +318,19 @@
+@@ -308,13 +320,19 @@
      vkGetPhysicalDeviceMemoryProperties(physical_, &memory_);
      VkPhysicalDeviceFeatures features{};
      vkGetPhysicalDeviceFeatures(physical_, &features);
@@ -88,7 +90,7 @@
      float priority = 1;
      VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
      qi.queueFamilyIndex = family_;
-@@ -525,8 +541,68 @@
+@@ -525,8 +543,68 @@
                           nullptr, 1, &b);
      t.layout = layout;
  }
@@ -157,7 +159,7 @@
      Layout(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
      for (uint32_t face = 0; face < image.layers; face++)
          for (uint32_t level = 0; level < d.levels; level++) {
-@@ -535,12 +611,17 @@
+@@ -535,12 +613,17 @@
              DecodeLevel(d, level, face, guest, nullptr, pixels, pitch);
              if (pixels.empty())
                  Fail("texture decode failed");
@@ -178,16 +180,20 @@
              vkCmdCopyBufferToImage(cmd_, arena_, image.image, image.layout, 1, &c);
          }
      Layout(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-@@ -662,7 +743,7 @@
+@@ -662,8 +745,11 @@
          p->used = frame_;
          return p.get();
      }
 -    p = MakeImage(d.width, d.height, d.depth, d.levels, d.cube ? 6 : 1, FormatOf(Format(d.format).host), false, false);
 +    p = MakeImage(d.width, d.height, d.depth, d.levels, d.cube ? 6 : 1, FormatOf(Format(d.format).host, bc_supported_), false, false);
      p->desc = d;
++    LOG_FIRST(16, "vulkan: tex fmt=0x%02X (%s) %ux%u lin=%d pal=%d comp=%d pitch=%u",
++              d.format, Format(d.format).name, d.width, d.height, int(d.linear), int(colors != nullptr),
++              int(Format(d.format).compressed), d.pitch);
      if (!colors)
          UploadImage(*p, d);
-@@ -813,6 +894,11 @@
+     else {
+@@ -813,6 +899,11 @@
      auto it = shaders_.find(key);
      if (it != shaders_.end())
          return it->second;
@@ -199,7 +205,7 @@
      auto dir = app::CacheDir() / "shader-cache-vulkan";
      std::filesystem::create_directories(dir);
      std::string name = std::to_string(key);
-@@ -876,11 +962,12 @@
+@@ -876,11 +967,12 @@
      auto size = f.tellg();
      if (size <= 0 || size % 4)
          Fail("invalid SPIR-V file");
@@ -213,7 +219,118 @@
      VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
      ci.codeSize = words.size() * 4;
      ci.pCode = words.data();
-@@ -1511,6 +1598,30 @@
+@@ -1439,16 +1531,55 @@
+         for (int i = 0; i < 256; i++)
+             gamma_identity_ &= ramp[c * 256 + i] == i;
+ }
++#ifdef __ANDROID__
++bool Vulkan::RecreateSurface() {
++    Submit();
++    Check(vkQueueWaitIdle(queue_), "surface recreate idle");
++    if (swap_) {
++        vkDestroySwapchainKHR(device_, swap_, nullptr);
++        swap_ = VK_NULL_HANDLE;
++        swap_images_.clear();
++    }
++    if (surface_) {
++        vkDestroySurfaceKHR(instance_, surface_, nullptr);
++        surface_ = VK_NULL_HANDLE;
++    }
++    if (!host::Foreground()) {
++        host::WaitForeground();
++    }
++    if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window *>(app::Window()), instance_, nullptr, &surface_)) {
++        LOGW("vulkan: SDL_Vulkan_CreateSurface deferred: %s", SDL_GetError());
++        surface_lost_ = true;
++        return false;
++    }
++    extent_ = {};
++    surface_epoch_ = host::SurfaceEpoch();
++    surface_lost_ = false;
++    LOGR("vulkan: surface recreated (epoch=%u)", surface_epoch_);
++    return true;
++}
++#endif
+ void Vulkan::Resize() {
+     auto size = app::LinuxWindowSize();
+     if (!size.width || !size.height)
+         return;
++#ifdef __ANDROID__
++    if (surface_lost_ && !RecreateSurface())
++        return;
++#endif
+     if (swap_ && extent_.width == size.width && extent_.height == size.height)
+         return;
+     Submit();
+     Check(vkQueueWaitIdle(queue_), "swapchain idle");
+     VkSurfaceCapabilitiesKHR caps;
+-    Check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_, surface_, &caps), "surface capabilities");
++    VkResult cap_res = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_, surface_, &caps);
++#ifdef __ANDROID__
++    if (cap_res == VK_ERROR_SURFACE_LOST_KHR) {
++        surface_lost_ = true;
++        return;
++    }
++#endif
++    Check(cap_res, "surface capabilities");
+     if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+         Fail("swapchain transfer destination unavailable");
+     uint32_t n = 0;
+@@ -1468,15 +1599,24 @@
+         ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
+     ci.imageFormat = choice.format;
+     ci.imageColorSpace = choice.colorSpace;
++#ifdef __ANDROID__
++    // Request identity transform so Android SurfaceFlinger rotates landscape output cleanly instead of drawing sideways.
++    ci.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
++                          ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
++                          : caps.currentTransform;
++    ci.imageExtent = VkExtent2D{std::clamp(size.width, caps.minImageExtent.width, caps.maxImageExtent.width),
++                                std::clamp(size.height, caps.minImageExtent.height, caps.maxImageExtent.height)};
++#else
++    ci.preTransform = caps.currentTransform;
+     ci.imageExtent = caps.currentExtent.width != 0xffffffffu
+                          ? caps.currentExtent
+                          : VkExtent2D{std::clamp(size.width, caps.minImageExtent.width, caps.maxImageExtent.width),
+                                       std::clamp(size.height, caps.minImageExtent.height, caps.maxImageExtent.height)};
++#endif
+     if (!ci.imageExtent.width || !ci.imageExtent.height)
+         return;
+     ci.imageArrayLayers = 1;
+     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+-    ci.preTransform = caps.currentTransform;
+     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+     if (!(caps.supportedCompositeAlpha & ci.compositeAlpha))
+         ci.compositeAlpha =
+@@ -1484,8 +1624,15 @@
+     ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+     ci.clipped = VK_TRUE;
+     ci.oldSwapchain = swap_;
+-    VkSwapchainKHR next;
+-    Check(vkCreateSwapchainKHR(device_, &ci, nullptr, &next), "swapchain");
++    VkSwapchainKHR next = VK_NULL_HANDLE;
++    VkResult sc_res = vkCreateSwapchainKHR(device_, &ci, nullptr, &next);
++#ifdef __ANDROID__
++    if (sc_res == VK_ERROR_SURFACE_LOST_KHR || sc_res == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) {
++        surface_lost_ = true;
++        return;
++    }
++#endif
++    Check(sc_res, "swapchain");
+     if (swap_)
+         vkDestroySwapchainKHR(device_, swap_, nullptr);
+     swap_ = next;
+@@ -1494,7 +1641,8 @@
+     Check(vkGetSwapchainImagesKHR(device_, swap_, &n, nullptr), "swapchain images");
+     swap_images_.resize(n);
+     Check(vkGetSwapchainImagesKHR(device_, swap_, &n, swap_images_.data()), "swapchain images");
+-    LOGR("vulkan: swapchain %ux%u", extent_.width, extent_.height);
++    LOGR("vulkan: swapchain %ux%u (transform=0x%X, current=0x%X)", extent_.width, extent_.height,
++         unsigned(ci.preTransform), unsigned(caps.currentTransform));
+ }
+ void Vulkan::Capture(Image &t) {
+     auto dir = diag::CaptureDir();
+@@ -1511,6 +1659,18 @@
      LOGR("vulkan: captured %s", file.c_str());
  }
  void Vulkan::Present(const Surface &front) {
@@ -222,25 +339,41 @@
 +        Submit();
 +        host::WaitForeground();
 +    }
-+    const uint32_t epoch = host::SurfaceEpoch();
-+    if (epoch != surface_epoch_) {
-+        Submit();
-+        Check(vkQueueWaitIdle(queue_), "surface epoch idle");
-+        if (swap_) {
-+            vkDestroySwapchainKHR(device_, swap_, nullptr);
-+            swap_ = VK_NULL_HANDLE;
-+            swap_images_.clear();
++    if (surface_lost_ || host::SurfaceEpoch() != surface_epoch_) {
++        if (!RecreateSurface()) {
++            Submit();
++            return;
 +        }
-+        if (surface_) {
-+            vkDestroySurfaceKHR(instance_, surface_, nullptr);
-+            surface_ = VK_NULL_HANDLE;
-+        }
-+        if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window *>(app::Window()), instance_, nullptr, &surface_))
-+            Fail(SDL_GetError());
-+        extent_ = {};
-+        surface_epoch_ = epoch;
 +    }
 +#endif
      Image *t = Target(front, false);
      if (!t)
          Fail("present has no front surface");
+@@ -1524,6 +1684,14 @@
+     }
+     uint32_t index = 0;
+     VkResult result = vkAcquireNextImageKHR(device_, swap_, 30000000000ull, acquired_, VK_NULL_HANDLE, &index);
++#ifdef __ANDROID__
++    if (result == VK_ERROR_SURFACE_LOST_KHR) {
++        LOGW("vulkan: acquire surface lost, scheduling recreate");
++        surface_lost_ = true;
++        Submit();
++        return;
++    }
++#endif
+     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+         extent_ = {};
+         Resize();
+@@ -1584,6 +1752,12 @@
+     pi.pSwapchains = &swap_;
+     pi.pImageIndices = &index;
+     result = vkQueuePresentKHR(queue_, &pi);
++#ifdef __ANDROID__
++    if (result == VK_ERROR_SURFACE_LOST_KHR) {
++        LOGW("vulkan: present surface lost, scheduling recreate");
++        surface_lost_ = true;
++    } else
++#endif
+     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR && result != VK_ERROR_OUT_OF_DATE_KHR)
+         Check(result, "present");
+     if (adjusted)

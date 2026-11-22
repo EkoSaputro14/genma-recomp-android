@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Tag versi rilis Android (contoh: v0.8.0-android.1)'
+        description: 'Tag versi rilis Android (contoh: v0.8.0-android.2)'
         required: true
-        default: 'v0.8.0-android.1'
+        default: 'v0.8.0-android.2'
         type: string
       publish_release:
         description: 'Publikasikan langsung ke GitHub Releases'
@@ -124,7 +124,7 @@ jobs:
         run: |
           VERSION="${{ inputs.release_version || github.ref_name }}"
           if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
-            VERSION="v0.8.0-android.1"
+            VERSION="v0.8.0-android.2"
           fi
           CLEAN_NAME="${VERSION#v}"
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
@@ -166,14 +166,12 @@ jobs:
           body: |
             ### Genma Onimusha — Android ARM64 Port (${{ steps.ver.outputs.tag }})
 
-            - **Arsitektur**: Port native ARM64 (`libSDL3.so` + `libmain.so`) dari `rafaelkenedy/genma-recomp` menggunakan pola *game loader* `RanggaCasper/Black-Android`
-            - **Mode Build CI**: `${{ steps.recomp.outputs.mode }}` (32 partisi XBE terkompilasi + Vulkan + glslang in-process + CPU DXT1/3/5 fallback)
+            - **Perbaikan pada rilis ini**:
+              - Memperbaiki layar terputar 90° di Android (menggunakan `VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR` + landscape extent).
+              - Memperbaiki crash `VK_ERROR_SURFACE_LOST_KHR (-1000000000)` saat minimize / screenshot / kembali ke foreground dengan pemulihan `VkSurfaceKHR` otomatis.
+              - Menambahkan log diagnostik format tekstur awal (`LOG_FIRST`) untuk investigasi artefak atlas UI.
+            - **Arsitektur**: Port native ARM64 (`libSDL3.so` + `libmain.so`) dari `rafaelkenedy/genma-recomp` + *game loader* `RanggaCasper/Black-Android`
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`, 16 KB page-aligned
-            - **Cara Memuat Game di HP**:
-              1. Pasang APK dan buka **Genma Onimusha**.
-              2. Izinkan **All Files Access** (Android 11+) atau **Storage** (Android 10), **atau** langsung ketuk **Import game** untuk memilih `.iso` dari Downloads / USB / Cloud.
-              3. Alternatif manual: salin file `.iso` (Genma Onimusha USA) atau `default.xbe` + folder data ke `/storage/emulated/0/GenmaOnimusha` (atau folder `GenmaOnimusha` di SD Card, atau `Android/data/com.genmarecomp.android/files/assets`).
-              4. Game akan terdeteksi dan langsung *boot* otomatis.
           files: |
             release-dist/*.apk
             release-dist/SHA256SUMS
