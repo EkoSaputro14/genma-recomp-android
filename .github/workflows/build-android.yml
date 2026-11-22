@@ -124,7 +124,7 @@ jobs:
         run: |
           VERSION="${{ inputs.release_version || github.ref_name }}"
           if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
-            VERSION="v0.8.0-android.${{ github.run_number }}"
+            VERSION="v0.8.0-android.1"
           fi
           CLEAN_NAME="${VERSION#v}"
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
@@ -155,12 +155,13 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub Release
-        if: ${{ (inputs.publish_release == 'true') || startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ (inputs.publish_release == 'true') || startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: "Genma Onimusha Android ARM64 ${{ steps.ver.outputs.tag }}"
           prerelease: true
+          make_latest: true
           generate_release_notes: true
           body: |
             ### Genma Onimusha — Android ARM64 Port (${{ steps.ver.outputs.tag }})
