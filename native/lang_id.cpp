@@ -6,6 +6,7 @@
 #include "core/log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <fstream>
@@ -125,13 +126,20 @@ std::string UnescapeTsv(const std::string& s) {
     return out;
 }
 
-std::mutex g_override_lock;
-std::unordered_map<uint64_t, std::vector<uint8_t>> g_custom_overrides;
+struct CustomOverride {
+    std::vector<uint8_t> bytes;
+    bool needs_f0_arg = false;
+};
 
-const std::vector<uint8_t>* FindCustomOverride(uint64_t hash) {
+std::mutex g_override_lock;
+std::unordered_map<uint64_t, CustomOverride> g_custom_overrides;
+
+bool FindCustomOverride(uint64_t hash, CustomOverride& out) {
     std::lock_guard<std::mutex> lock(g_override_lock);
     auto it = g_custom_overrides.find(hash);
-    return it == g_custom_overrides.end() ? nullptr : &it->second;
+    if (it == g_custom_overrides.end()) return false;
+    out = it->second;
+    return true;
 }
 
 const char* FindBuiltinRdt(uint64_t hash) {
@@ -194,18 +202,29 @@ bool PackXbeTableLocked(const XbeTableSpec& spec, std::vector<uint8_t>& out_data
 
     for (size_t i = 0; i < spec.count; ++i) {
         std::vector<uint8_t> entry;
+        const uint16_t orig_off = ReadU16(spec.orig_table.data() + i * 2);
+        const uint8_t* p = (orig_off < spec.orig_data.size()) ? (spec.orig_data.data() + orig_off) : nullptr;
+        const size_t rem = p ? (spec.orig_data.size() - orig_off) : 0;
+        const void* found = p ? std::memchr(p, spec.term_byte, rem) : nullptr;
+        const size_t term_idx = found ? size_t(static_cast<const uint8_t*>(found) - p) : 0;
+        // 0xF0 ({END}) is a 2-byte opcode (`0xF0 <arg>`) in Genma's text VM; 0xF7 is a 1-byte terminator.
+        const uint8_t orig_arg = (spec.term_byte == 0xF0 && found && term_idx + 1 < rem) ? p[term_idx + 1] : 0x00;
+
         if (spec.translations[i] != nullptr) {
             entry = EncodeGenma(spec.translations[i]);
+            if (spec.term_byte == 0xF0 && !entry.empty() && entry.back() == 0xF0) {
+                entry.push_back(orig_arg);
+            }
         } else {
-            uint16_t orig_off = ReadU16(spec.orig_table.data() + i * 2);
-            if (orig_off < spec.orig_data.size()) {
-                const uint8_t* p = spec.orig_data.data() + orig_off;
-                size_t rem = spec.orig_data.size() - orig_off;
-                const void* found = std::memchr(p, spec.term_byte, rem);
-                size_t len = found ? size_t(static_cast<const uint8_t*>(found) - p) + 1 : std::min<size_t>(rem, 1);
+            if (p && rem > 0) {
+                size_t len = found ? (term_idx + (spec.term_byte == 0xF0 ? 2u : 1u)) : std::min<size_t>(rem, 1);
+                len = std::min(len, rem);
                 entry.assign(p, p + len);
             } else {
                 entry.push_back(spec.term_byte);
+                if (spec.term_byte == 0xF0) {
+                    entry.push_back(0x00);
+                }
             }
         }
         std::string key(reinterpret_cast<const char*>(entry.data()), entry.size());
@@ -299,7 +318,7 @@ void LoadCustomOverrides(const std::filesystem::path& game_dir) {
     std::ifstream in(tsv);
     if (!in) return;
 
-    std::unordered_map<uint64_t, std::vector<uint8_t>> loaded;
+    std::unordered_map<uint64_t, CustomOverride> loaded;
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
@@ -314,7 +333,10 @@ void LoadCustomOverrides(const std::filesystem::path& game_dir) {
         } catch (...) {
             continue;
         }
-        loaded[h] = EncodeGenma(markup);
+        CustomOverride ov;
+        ov.bytes = EncodeGenma(markup);
+        ov.needs_f0_arg = EndsWith(markup, "{END}") && !ov.bytes.empty() && ov.bytes.back() == 0xF0;
+        loaded[h] = std::move(ov);
     }
     {
         std::lock_guard<std::mutex> lock(g_override_lock);
@@ -394,18 +416,27 @@ std::vector<BytePatch> BuildFilePatches(const std::string& xbox_path, uint64_t f
         const uint8_t* raw_ptr = orig_sec.data() + s;
         size_t raw_len = e - s;
         const void* f0 = std::memchr(raw_ptr, 0xF0, raw_len);
-        size_t key_len = f0 ? size_t(static_cast<const uint8_t*>(f0) - raw_ptr) + 1 : raw_len;
+        const size_t key_len = f0 ? size_t(static_cast<const uint8_t*>(f0) - raw_ptr) + 1 : raw_len;
+        const uint8_t orig_f0_arg = (f0 && key_len < raw_len) ? raw_ptr[key_len] : 0x00;
 
         const uint64_t h = Fnv1a64(raw_ptr, key_len);
         std::vector<uint8_t> payload;
-        if (const auto* custom = FindCustomOverride(h)) {
-            payload = *custom;
+        CustomOverride custom;
+        if (FindCustomOverride(h, custom)) {
+            payload = std::move(custom.bytes);
+            if (f0 && custom.needs_f0_arg) {
+                payload.push_back(orig_f0_arg);
+            }
             replaced++;
         } else if (const char* id_str = FindBuiltinRdt(h)) {
             payload = EncodeGenma(id_str);
+            if (f0 && !payload.empty() && payload.back() == 0xF0) {
+                payload.push_back(orig_f0_arg);
+            }
             replaced++;
         } else {
-            payload.assign(raw_ptr, raw_ptr + key_len);
+            // Preserve untranslated slices verbatim (including 0xF0 <arg> cutscene timers and non-0xF0 records).
+            payload.assign(raw_ptr, raw_ptr + raw_len);
         }
 
         std::string dedup_key(reinterpret_cast<const char*>(payload.data()), payload.size());
