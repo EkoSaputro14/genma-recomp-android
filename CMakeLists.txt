@@ -88,6 +88,7 @@ if(ANDROID)
     list(APPEND RUNTIME_SOURCES
          ${SDK}/runtime/app/settings.cpp
          ${SDK}/runtime/audio/sdl_audio.cpp
+         ${SDK}/runtime/gpu/render_thread.cpp
          ${SDK}/runtime/gpu/vulkan.cpp
          ${SDK}/runtime/gpu/shaders.cpp
          ${SDK}/runtime/gpu/texture.cpp

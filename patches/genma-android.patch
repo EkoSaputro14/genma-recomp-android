@@ -1,8 +1,95 @@
+diff --git a/sdk/runtime/gpu/render_thread.cpp b/sdk/runtime/gpu/render_thread.cpp
+index c6c0b9c..c31eb7c 100644
+--- a/sdk/runtime/gpu/render_thread.cpp
++++ b/sdk/runtime/gpu/render_thread.cpp
+@@ -2,6 +2,7 @@
+ // takes at call time (state changes, resource headers, indices, rects) and goes on; vertex, texture and surface memory
+ // are read when the draw runs, as the console's GPU reads them after the call returns. The XDK's fences, busy checks
+ // and locks wait for that.
++#ifdef _WIN32
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+ #endif
+@@ -10,6 +11,9 @@
+ #endif
+ #include <windows.h>
+ #include <smmintrin.h>
++#elif defined(__linux__) || defined(__ANDROID__)
++#include <pthread.h>
++#endif
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -83,6 +87,7 @@ std::vector<Range> StateRanges() {
+ 
+ // equal bytes, 16 at a time: most of the state is compared on every draw
+ bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
++#ifdef _WIN32
+     size_t i = 0;
+     __m128i diff = _mm_setzero_si128();
+     for (; i + 16 <= n; i += 16)
+@@ -90,6 +95,9 @@ bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
+                                                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i))));
+     if (!_mm_testz_si128(diff, diff)) return false;
+     return i == n || !std::memcmp(a + i, b + i, n - i);
++#else
++    return std::memcmp(a, b, n) == 0;
++#endif
+ }
+ 
+ using Clock = std::chrono::steady_clock;
+@@ -386,10 +394,14 @@ private:
+     }
+ 
+     void Run() {
++#ifdef _WIN32
+         using SetDescription = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+         if (auto set = reinterpret_cast<SetDescription>(
+                 reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription"))))
+             set(GetCurrentThread(), L"render");
++#elif defined(__linux__) || defined(__ANDROID__)
++        pthread_setname_np(pthread_self(), "render");
++#endif
+         for (;;) {
+             Batch* b;
+             {
 diff --git a/sdk/runtime/gpu/texture.cpp b/sdk/runtime/gpu/texture.cpp
-index 7c896d3..85c9b30 100644
+index 7c896d3..f1bd4dd 100644
 --- a/sdk/runtime/gpu/texture.cpp
 +++ b/sdk/runtime/gpu/texture.cpp
-@@ -369,28 +369,90 @@ void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint
+@@ -338,13 +338,26 @@ void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint
+         out.resize(size_t(row_pitch) * h * z);
+         float* o = reinterpret_cast<float*>(out.data());
+         uint32_t bpp = f.bits / 8;
++        if (d.linear) {
++            for (uint32_t y = 0; y < h; y++) {
++                const uint8_t* sp = src + size_t(y) * d.pitch;
++                float* dp = o + size_t(y) * w;
++                for (uint32_t x = 0; x < w; x++) dp[x] = DepthTexel(d.format, sp + size_t(x) * bpp);
++            }
++            return;
++        }
+         uint32_t mx, my, mz;
+         SwizzleMasks(w, h, z, mx, my, mz);
+-        for (uint32_t y = 0; y < h; y++)
+-            for (uint32_t x = 0; x < w; x++) {
+-                uint32_t off = d.linear ? y * d.pitch + x * bpp : (Deposit(x, mx) | Deposit(y, my)) * bpp;
+-                o[y * w + x] = DepthTexel(d.format, src + off);
+-            }
++        thread_local std::vector<uint32_t> xo, yo;
++        xo.resize(w);
++        yo.resize(h);
++        for (uint32_t x = 0; x < w; x++) xo[x] = Deposit(x, mx);
++        for (uint32_t y = 0; y < h; y++) yo[y] = Deposit(y, my);
++        for (uint32_t y = 0; y < h; y++) {
++            uint32_t yy = yo[y];
++            float* dp = o + size_t(y) * w;
++            for (uint32_t x = 0; x < w; x++) dp[x] = DepthTexel(d.format, src + size_t(xo[x] | yy) * bpp);
++        }
+         return;
+     }
+     row_pitch = w * 4;
+@@ -369,28 +382,90 @@ void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint
          return;
      }
      if (d.linear) {
@@ -104,7 +191,7 @@ index 7c896d3..85c9b30 100644
  }
  
  uint32_t LinearColorFormat(uint32_t f) {
-@@ -446,15 +508,31 @@ bool CopySurfaceMemory(const Surface& src, const Surface& dst, uint32_t count, u
+@@ -446,15 +521,32 @@ bool CopySurfaceMemory(const Surface& src, const Surface& dst, uint32_t count, u
      bool block = fa.compressed;
      if (block != fb.compressed || (block && a.format != b.format) || fa.bits != fb.bits || fa.bits < 8) return false;
      uint32_t bpp = block ? fa.bits : fa.bits / 8, u = block ? 4 : 1;
@@ -124,8 +211,8 @@ index 7c896d3..85c9b30 100644
 +    const uint32_t a_stride = block ? uint32_t((a.width + 3) / 4) * bpp : a.pitch;
 +    const uint32_t b_stride = block ? uint32_t((b.width + 3) / 4) * bpp : b.pitch;
 +    thread_local std::vector<uint32_t> axo, ayo, bxo, byo;
++    uint32_t ax = 0, ay = 0, az = 0, bx = 0, by = 0, bz = 0;
 +    if (!row_linear_a) {
-+        uint32_t ax, ay, az;
 +        SwizzleMasks(a.width, a.height, 1, ax, ay, az);
 +        axo.resize(size_t(aw));
 +        ayo.resize(size_t(ah));
@@ -133,17 +220,18 @@ index 7c896d3..85c9b30 100644
 +        for (int32_t y = 0; y < ah; y++) ayo[size_t(y)] = Deposit(uint32_t(y), ay);
 +    }
 +    if (!row_linear_b) {
-+        uint32_t bx, by, bz;
 +        SwizzleMasks(b.width, b.height, 1, bx, by, bz);
 +        bxo.resize(size_t(bw));
 +        byo.resize(size_t(bh));
 +        for (int32_t x = 0; x < bw; x++) bxo[size_t(x)] = Deposit(uint32_t(x), bx);
 +        for (int32_t y = 0; y < bh; y++) byo[size_t(y)] = Deposit(uint32_t(y), by);
 +    }
++    const bool pair_a = !row_linear_a && aw >= 2 && ((ax & 1u) != 0) && ((ay & 1u) == 0);
++    const bool pair_b = !row_linear_b && bw >= 2 && ((bx & 1u) != 0) && ((by & 1u) == 0);
      uint32_t n = count && rects ? count : 1;
      for (uint32_t i = 0; i < n; i++) {
          int32_t x0 = 0, y0 = 0, x1 = int32_t(a.width), y1 = int32_t(a.height), dx = 0, dy = 0;
-@@ -473,13 +551,41 @@ bool CopySurfaceMemory(const Surface& src, const Surface& dst, uint32_t count, u
+@@ -473,13 +565,71 @@ bool CopySurfaceMemory(const Surface& src, const Surface& dst, uint32_t count, u
          }
          int32_t U = int32_t(u);
          x0 /= U, y0 /= U, dx /= U, dy /= U, x1 = (x1 + U - 1) / U, y1 = (y1 + U - 1) / U;
@@ -158,9 +246,10 @@ index 7c896d3..85c9b30 100644
 +        int32_t xs = std::max<int32_t>({x0, 0, x0 - dx});
 +        int32_t xe = std::min<int32_t>({x1, aw, bw - dx + x0});
 +        if (xs >= xe || ys >= ye) continue;
++        const int32_t xoff = dx - x0;
 +        if (row_linear_a && row_linear_b) {
 +            size_t row_bytes = size_t(xe - xs) * bpp;
-+            uint32_t tx0 = uint32_t(dx + xs - x0);
++            uint32_t tx0 = uint32_t(xs + xoff);
 +            for (int32_t y = ys; y < ye; y++) {
 +                uint32_t ty = uint32_t(dy + y - y0);
 +                std::memcpy(dst_base + size_t(ty) * b_stride + size_t(tx0) * bpp,
@@ -168,34 +257,63 @@ index 7c896d3..85c9b30 100644
              }
 +            continue;
 +        }
++        if (bpp == 4 && !row_linear_a && row_linear_b) {
++            for (int32_t y = ys; y < ye; y++) {
++                uint32_t ayy = ayo[size_t(y)];
++                uint8_t* dp = dst_base + size_t(dy + y - y0) * b_stride + size_t(xs + xoff) * 4;
++                int32_t x = xs;
++                if (pair_a) {
++                    if ((x & 1) && x < xe) {
++                        std::memcpy(dp, src_base + size_t(axo[size_t(x)] | ayy) * 4, 4);
++                        dp += 4;
++                        x++;
++                    }
++                    for (; x + 1 < xe; x += 2, dp += 8) {
++                        std::memcpy(dp, src_base + size_t(axo[size_t(x)] | ayy) * 4, 8);
++                    }
++                }
++                for (; x < xe; x++, dp += 4) std::memcpy(dp, src_base + size_t(axo[size_t(x)] | ayy) * 4, 4);
++            }
++            continue;
++        }
++        if (bpp == 4 && row_linear_a && !row_linear_b) {
++            for (int32_t y = ys; y < ye; y++) {
++                const uint8_t* sp = src_base + size_t(y) * a_stride + size_t(xs) * 4;
++                uint32_t byy = byo[size_t(dy + y - y0)];
++                int32_t x = xs;
++                if (pair_b) {
++                    if (((x + xoff) & 1) && x < xe) {
++                        std::memcpy(dst_base + size_t(bxo[size_t(x + xoff)] | byy) * 4, sp, 4);
++                        sp += 4;
++                        x++;
++                    }
++                    for (; x + 1 < xe; x += 2, sp += 8) {
++                        std::memcpy(dst_base + size_t(bxo[size_t(x + xoff)] | byy) * 4, sp, 8);
++                    }
++                }
++                for (; x < xe; x++, sp += 4) std::memcpy(dst_base + size_t(bxo[size_t(x + xoff)] | byy) * 4, sp, 4);
++            }
++            continue;
++        }
 +        for (int32_t y = ys; y < ye; y++) {
 +            int32_t ty = dy + y - y0;
 +            uint32_t a_y = row_linear_a ? uint32_t(y) * a_stride : ayo[size_t(y)];
 +            uint32_t b_y = row_linear_b ? uint32_t(ty) * b_stride : byo[size_t(ty)];
-+            if (bpp == 4) {
-+                for (int32_t x = xs; x < xe; x++) {
-+                    int32_t tx = dx + x - x0;
-+                    const uint8_t* sp = src_base + (row_linear_a ? size_t(a_y) + size_t(x) * 4 : size_t(axo[size_t(x)] | a_y) * 4);
-+                    uint8_t* dp = dst_base + (row_linear_b ? size_t(b_y) + size_t(tx) * 4 : size_t(bxo[size_t(tx)] | b_y) * 4);
-+                    std::memcpy(dp, sp, 4);
-+                }
-+            } else {
-+                for (int32_t x = xs; x < xe; x++) {
-+                    int32_t tx = dx + x - x0;
-+                    const uint8_t* sp = src_base + (row_linear_a ? size_t(a_y) + size_t(x) * bpp : size_t(axo[size_t(x)] | a_y) * bpp);
-+                    uint8_t* dp = dst_base + (row_linear_b ? size_t(b_y) + size_t(tx) * bpp : size_t(bxo[size_t(tx)] | b_y) * bpp);
-+                    std::memcpy(dp, sp, bpp);
-+                }
++            for (int32_t x = xs; x < xe; x++) {
++                int32_t tx = x + xoff;
++                const uint8_t* sp = src_base + (row_linear_a ? size_t(a_y) + size_t(x) * bpp : size_t(axo[size_t(x)] | a_y) * bpp);
++                uint8_t* dp = dst_base + (row_linear_b ? size_t(b_y) + size_t(tx) * bpp : size_t(bxo[size_t(tx)] | b_y) * bpp);
++                std::memcpy(dp, sp, bpp);
 +            }
 +        }
      }
      MarkDirty(dst.header);
      return true;
 diff --git a/sdk/runtime/gpu/vertex.cpp b/sdk/runtime/gpu/vertex.cpp
-index 3ebd900..aa52550 100644
+index 3ebd900..70eb733 100644
 --- a/sdk/runtime/gpu/vertex.cpp
 +++ b/sdk/runtime/gpu/vertex.cpp
-@@ -147,12 +147,37 @@ void ListIndices(uint32_t prim, uint32_t count, F local, std::vector<uint32_t>&
+@@ -147,26 +147,80 @@ void ListIndices(uint32_t prim, uint32_t count, F local, std::vector<uint32_t>&
              if (prim == 3 && count > 2) ix.insert(ix.end(), {local(count - 1), local(0)});
              break;
          case 5:  // triangle list
@@ -237,7 +355,55 @@ index 3ebd900..aa52550 100644
              }
              break;
          case 7:   // fan
-@@ -395,21 +420,63 @@ constexpr uint64_t kRangedSpanSlack = 64;
+         case 10:  // polygon
+-            for (uint32_t i = 1; i + 1 < count; i++) ix.insert(ix.end(), {local(0), local(i), local(i + 1)});
++            if (count >= 3) {
++                uint32_t tris = count - 2;
++                size_t base = ix.size();
++                ix.resize(base + size_t(tris) * 3);
++                uint32_t* dst = ix.data() + base;
++                uint32_t v0 = local(0), prev = local(1);
++                for (uint32_t i = 2; i < count; i++, dst += 3) {
++                    uint32_t cur = local(i);
++                    dst[0] = v0;
++                    dst[1] = prev;
++                    dst[2] = cur;
++                    prev = cur;
++                }
++            }
+             break;
+         case 8:  // quad list
+-            for (uint32_t i = 0; i + 3 < count; i += 4) {
+-                ix.insert(ix.end(), {local(i), local(i + 1), local(i + 2), local(i), local(i + 2), local(i + 3)});
++            if (count >= 4) {
++                uint32_t quads = count / 4;
++                size_t base = ix.size();
++                ix.resize(base + size_t(quads) * 6);
++                uint32_t* dst = ix.data() + base;
++                for (uint32_t i = 0; i < quads * 4; i += 4, dst += 6) {
++                    uint32_t a = local(i), b = local(i + 1), c = local(i + 2), d = local(i + 3);
++                    dst[0] = a; dst[1] = b; dst[2] = c;
++                    dst[3] = a; dst[4] = c; dst[5] = d;
++                }
+             }
+             break;
+         case 9:  // quad strip
+-            for (uint32_t i = 0; i + 3 < count; i += 2) {
+-                ix.insert(ix.end(), {local(i), local(i + 1), local(i + 2), local(i + 1), local(i + 3), local(i + 2)});
++            if (count >= 4) {
++                uint32_t quads = (count - 2) / 2;
++                size_t base = ix.size();
++                ix.resize(base + size_t(quads) * 6);
++                uint32_t* dst = ix.data() + base;
++                for (uint32_t i = 0; i < quads * 2; i += 2, dst += 6) {
++                    uint32_t a = local(i), b = local(i + 1), c = local(i + 2), d = local(i + 3);
++                    dst[0] = a; dst[1] = b; dst[2] = c;
++                    dst[3] = b; dst[4] = d; dst[5] = c;
++                }
+             }
+             break;
+     }
+@@ -395,21 +449,78 @@ constexpr uint64_t kRangedSpanSlack = 64;
  bool AssembleConverted(const State& s, const Inputs& inputs, const DrawRange& d, Assembled& out) {
      using namespace kernel;
      int nregs = inputs.nregs;
@@ -269,45 +435,60 @@ index 3ebd900..aa52550 100644
 -            Convert(in.type, src + size_t(id) * stride, &out.vertices[(size_t(v) * nregs + k) * 4]);
 +        float* dst = vbase + size_t(k) * 4;
 +        uint32_t type = in.type, kind = type & 15, comp = std::min<uint32_t>((type >> 4) & 15, 4);
++        auto emit = [&](auto&& fn) {
++            if (ranged) {
++                const uint8_t* p = src + size_t(d.first_vertex) * stride;
++                for (uint32_t v = 0; v < n; v++, p += stride, dst += vstep) fn(p, dst);
++            } else {
++                for (uint32_t v = 0; v < n; v++, dst += vstep) fn(src + size_t(seq[v]) * stride, dst);
++            }
++        };
 +        if (type == kTypeFloat2H) {
-+            for (uint32_t v = 0; v < n; v++, dst += vstep) {
-+                const uint8_t* p = src + size_t(ranged ? d.first_vertex + v : seq[v]) * stride;
++            emit([](const uint8_t* p, float* o) {
 +                float f3[3];
 +                std::memcpy(f3, p, 12);
-+                dst[0] = f3[0];
-+                dst[1] = f3[1];
-+                dst[2] = 0.0f;
-+                dst[3] = f3[2];
-+            }
-+        } else if (kind == 2) {  // FLOAT
++                o[0] = f3[0];
++                o[1] = f3[1];
++                o[2] = 0.0f;
++                o[3] = f3[2];
++            });
++        } else if (kind == 2 && comp == 4) {
++            emit([](const uint8_t* p, float* o) { std::memcpy(o, p, 16); });
++        } else if (kind == 2 && comp == 3) {
++            emit([](const uint8_t* p, float* o) {
++                std::memcpy(o, p, 12);
++                o[3] = 1.0f;
++            });
++        } else if (kind == 2 && comp == 2) {
++            emit([](const uint8_t* p, float* o) {
++                std::memcpy(o, p, 8);
++                o[2] = 0.0f;
++                o[3] = 1.0f;
++            });
++        } else if (kind == 2) {  // FLOAT (0 or 1 component)
 +            const size_t bytes = size_t(comp) * 4;
-+            for (uint32_t v = 0; v < n; v++, dst += vstep) {
-+                const uint8_t* p = src + size_t(ranged ? d.first_vertex + v : seq[v]) * stride;
-+                dst[0] = 0.0f;
-+                dst[1] = 0.0f;
-+                dst[2] = 0.0f;
-+                dst[3] = 1.0f;
-+                std::memcpy(dst, p, bytes);
-+            }
++            emit([bytes](const uint8_t* p, float* o) {
++                o[0] = 0.0f;
++                o[1] = 0.0f;
++                o[2] = 0.0f;
++                o[3] = 1.0f;
++                std::memcpy(o, p, bytes);
++            });
 +        } else if (kind == 0) {  // D3DCOLOR (B,G,R,A)
 +            constexpr float inv255 = 1.0f / 255.0f;
-+            for (uint32_t v = 0; v < n; v++, dst += vstep) {
-+                const uint8_t* p = src + size_t(ranged ? d.first_vertex + v : seq[v]) * stride;
-+                dst[0] = p[2] * inv255;
-+                dst[1] = p[1] * inv255;
-+                dst[2] = p[0] * inv255;
-+                dst[3] = p[3] * inv255;
-+            }
++            emit([](const uint8_t* p, float* o) {
++                o[0] = p[2] * inv255;
++                o[1] = p[1] * inv255;
++                o[2] = p[0] * inv255;
++                o[3] = p[3] * inv255;
++            });
 +        } else {
-+            for (uint32_t v = 0; v < n; v++, dst += vstep) {
-+                uint32_t id = ranged ? d.first_vertex + v : seq[v];
-+                Convert(type, src + size_t(id) * stride, dst);
-+            }
++            emit([type](const uint8_t* p, float* o) { Convert(type, p, o); });
          }
          out.elements[size_t(inputs.regs[k])] = {DXGI_FORMAT_R32G32B32A32_FLOAT, 0, uint16_t(k * 16)};
      }
 diff --git a/sdk/runtime/gpu/vulkan.cpp b/sdk/runtime/gpu/vulkan.cpp
-index fc93631..0903174 100644
+index fc93631..3ff723b 100644
 --- a/sdk/runtime/gpu/vulkan.cpp
 +++ b/sdk/runtime/gpu/vulkan.cpp
 @@ -5,6 +5,7 @@
@@ -465,7 +646,7 @@ index fc93631..0903174 100644
      VkInstance instance_{};
      VkSurfaceKHR surface_{};
      VkPhysicalDevice physical_{};
-@@ -177,46 +263,67 @@ class Vulkan final : public Backend {
+@@ -177,47 +263,69 @@ class Vulkan final : public Backend {
      VkQueue queue_{};
      uint32_t family_ = 0;
      VkPhysicalDeviceMemoryProperties memory_{};
@@ -496,7 +677,7 @@ index fc93631..0903174 100644
 -    std::map<uint64_t, VkSampler> samplers_;
 -    std::map<uint64_t, VkShaderModule> shaders_;
 -    std::map<std::vector<uint64_t>, VkPipeline> pipelines_;
-+    std::unordered_map<uint64_t, std::unique_ptr<Image>> targets_, textures_;
++    std::unordered_map<uint64_t, std::unique_ptr<Image>> targets_, textures_, copy_cache_;
 +    std::unique_ptr<Image> white_, gamma_lut_, gamma_out_;
 +    VkSampler gamma_sampler_{};
 +    VkShaderModule gamma_vs_{}, gamma_ps_{};
@@ -516,7 +697,8 @@ index fc93631..0903174 100644
 +    std::unordered_map<uint64_t, uint64_t> epoch_sum_;
 +    uint32_t completed_fence_ = 0;
 +    Assembled asm_{};
-+    std::vector<uint8_t> decode_pixels_, decode_bgra_;
++    std::vector<uint8_t> decode_pixels_, decode_bgra_, stencil_u8_;
++    std::vector<uint32_t> depth_u32_;
 +    PerfWindow perf_{};
 +    std::chrono::steady_clock::time_point log_time_{std::chrono::steady_clock::now()};
      uint8_t gamma_[768]{};
@@ -547,11 +729,13 @@ index fc93631..0903174 100644
 -    void UploadImage(Image &, const TextureDesc &);
 +    void UploadImage(Image &, const TextureDesc &, const uint32_t *colors = nullptr);
      void UploadDepth(Image &, const TextureDesc &);
+-    Image *Target(const Surface &, bool);
 +    bool EnsureGammaResources(uint32_t w, uint32_t h);
-     Image *Target(const Surface &, bool);
++    Image *Target(const Surface &, bool, bool sync_dirty = true);
      Image *Texture(uint32_t, uint32_t);
      VkSampler Sampler(const State &, int, bool);
-@@ -241,15 +348,49 @@ class Vulkan final : public Backend {
+     VkRenderPass Pass(bool, bool);
+@@ -241,15 +349,49 @@ class Vulkan final : public Backend {
          LOG_FIRST(1, "vulkan: synchronous development readback for NOOVERWRITE");
          Sync(d, 0);
      }
@@ -606,7 +790,7 @@ index fc93631..0903174 100644
          query_sum_ = 0;
      }
      void GetReport(uint32_t) override;
-@@ -308,13 +449,19 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
+@@ -308,13 +450,19 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
      vkGetPhysicalDeviceMemoryProperties(physical_, &memory_);
      VkPhysicalDeviceFeatures features{};
      vkGetPhysicalDeviceFeatures(physical_, &features);
@@ -629,7 +813,7 @@ index fc93631..0903174 100644
      float priority = 1;
      VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
      qi.queueFamilyIndex = family_;
-@@ -329,19 +476,6 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
+@@ -329,19 +477,6 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
      di.pEnabledFeatures = &enable;
      Check(vkCreateDevice(physical_, &di, nullptr, &device_), "create device");
      vkGetDeviceQueue(device_, family_, 0, &queue_);
@@ -649,7 +833,7 @@ index fc93631..0903174 100644
      VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
      bi.size = kArena;
      bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-@@ -379,11 +513,28 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
+@@ -379,11 +514,28 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
      VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768},
                                      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 65536},
                                      {VK_DESCRIPTOR_TYPE_SAMPLER, 65536}};
@@ -683,7 +867,7 @@ index fc93631..0903174 100644
      VkQueryPoolCreateInfo qp{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
      qp.queryType = VK_QUERY_TYPE_OCCLUSION;
      qp.queryCount = 8192;
-@@ -397,62 +548,171 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
+@@ -397,62 +549,171 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
      cp.bufferOffset = off;
      cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
      cp.imageExtent = {1, 1, 1};
@@ -769,10 +953,14 @@ index fc93631..0903174 100644
 +    Check(vkBeginCommandBuffer(f.cmd, &b), "begin command buffer");
 +    vkCmdResetQueryPool(f.cmd, queries_, QueryBase(), 4096);
 +    f.recording = true;
-+}
+ }
+-void Vulkan::Submit(VkSemaphore wait) {
+-    if (!recording_)
 +void Vulkan::EndRender() {
 +    if (!rendering_)
-+        return;
+         return;
+-    Check(vkEndCommandBuffer(cmd_), "end command buffer");
+-    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 +    vkCmdEndRenderPass(Cmd());
 +    rendering_ = false;
 +    rend_color_ = rend_depth_ = nullptr;
@@ -801,18 +989,14 @@ index fc93631..0903174 100644
 +    rendering_ = true;
 +    rend_color_ = rt;
 +    rend_depth_ = ds;
- }
--void Vulkan::Submit(VkSemaphore wait) {
--    if (!recording_)
++}
 +void Vulkan::Submit(bool sync, VkSemaphore wait, VkSemaphore signal) {
 +    EndRender();
 +    FrameSlot &f = CurrentSlot();
 +    if (!f.recording) {
 +        if (sync)
 +            WaitSlot(f, slot_);
-         return;
--    Check(vkEndCommandBuffer(cmd_), "end command buffer");
--    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
++        return;
 +    }
 +    if (f.query_next > f.report_first) {
 +        f.events.push_back({false, 0, f.report_first, f.query_next, frame_, report_epoch_});
@@ -889,7 +1073,7 @@ index fc93631..0903174 100644
  }
  std::unique_ptr<Image> Vulkan::MakeImage(uint32_t w, uint32_t h, uint32_t depth, uint32_t levels, uint32_t layers,
                                           VkFormat format, bool z, bool target) {
-@@ -503,45 +763,156 @@ std::unique_ptr<Image> Vulkan::MakeImage(uint32_t w, uint32_t h, uint32_t depth,
+@@ -503,100 +764,291 @@ std::unique_ptr<Image> Vulkan::MakeImage(uint32_t w, uint32_t h, uint32_t depth,
      return t;
  }
  void Vulkan::DestroyImage(Image &t) {
@@ -1060,22 +1244,183 @@ index fc93631..0903174 100644
          }
      Layout(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
  }
-@@ -587,11 +958,11 @@ void Vulkan::UploadDepth(Image &image, const TextureDesc &d) {
+ void Vulkan::UploadDepth(Image &image, const TextureDesc &d) {
+-    std::vector<uint8_t> decoded;
+-    uint32_t pitch = 0;
+-    const auto *guest = static_cast<const uint8_t *>(kernel::HostPtr(d.data));
+-    DecodeLevel(d, 0, 0, guest, nullptr, decoded, pitch);
+-    if (decoded.size() != size_t(d.width) * d.height * 4)
+-        Fail("invalid depth decode");
+-    std::vector<uint32_t> depth(size_t(d.width) * d.height);
+-    std::vector<uint8_t> stencil(depth.size(), 0);
+-    bool has_stencil = Format(d.format).bits == 32;
+-    for (uint32_t y = 0; y < d.height; y++)
+-        for (uint32_t x = 0; x < d.width; x++) {
+-            size_t i = size_t(y) * d.width + x;
+-            float value;
+-            std::memcpy(&value, decoded.data() + i * 4, 4);
+-            depth[i] = uint32_t(std::lround(std::clamp(value, 0.0f, 1.0f) * 16777215.0f));
++    const uint8_t *guest = static_cast<const uint8_t *>(kernel::HostPtr(d.data));
++    const uint32_t w = d.width, h = d.height;
++    const size_t total = size_t(w) * h;
++    depth_u32_.resize(total);
++    uint32_t *depth = depth_u32_.data();
++    const bool has_stencil = Format(d.format).bits == 32;
++    stencil_u8_.resize(total);
++    uint8_t *stencil = stencil_u8_.data();
++    if (!has_stencil)
++        std::memset(stencil, 0, total);
++    thread_local std::vector<uint32_t> xo, yo;
++    if (!d.linear) {
++        uint32_t mx = 0, my = 0;
++        uint32_t bit = 1, lx = uint32_t(std::bit_width(std::max(w, 1u) - 1)),
++                 ly = uint32_t(std::bit_width(std::max(h, 1u) - 1));
++        for (uint32_t i = 0; bit && (i < lx || i < ly); i++) {
++            if (i < lx) {
++                mx |= bit;
++                bit <<= 1;
++            }
++            if (i < ly) {
++                my |= bit;
++                bit <<= 1;
++            }
++        }
++        auto dep = [](uint32_t v, uint32_t mask) {
++            uint32_t r = 0;
++            for (uint32_t b = 1; mask; b <<= 1) {
++                uint32_t low = mask & (~mask + 1);
++                if (v & b) r |= low;
++                mask &= mask - 1;
++            }
++            return r;
++        };
++        xo.resize(w);
++        yo.resize(h);
++        for (uint32_t x = 0; x < w; x++) xo[x] = dep(x, mx);
++        for (uint32_t y = 0; y < h; y++) yo[y] = dep(y, my);
++    }
++    if (d.format == 0x2E) {  // LIN_D24S8
++        for (uint32_t y = 0; y < h; y++) {
++            const uint8_t *sp = guest + size_t(y) * d.pitch;
++            uint32_t *dp = depth + size_t(y) * w;
++            uint8_t *stp = stencil + size_t(y) * w;
++            for (uint32_t x = 0; x < w; x++) {
++                uint32_t v;
++                std::memcpy(&v, sp + size_t(x) * 4, 4);
++                dp[x] = v >> 8;
++                stp[x] = uint8_t(v);
++            }
++        }
++    } else if (d.format == 0x2A) {  // D24S8 swizzled
++        for (uint32_t y = 0; y < h; y++) {
++            uint32_t yy = yo[y];
++            uint32_t *dp = depth + size_t(y) * w;
++            uint8_t *stp = stencil + size_t(y) * w;
++            for (uint32_t x = 0; x < w; x++) {
++                uint32_t v;
++                std::memcpy(&v, guest + size_t(xo[x] | yy) * 4, 4);
++                dp[x] = v >> 8;
++                stp[x] = uint8_t(v);
++            }
++        }
++    } else if (d.format == 0x30) {  // LIN_D16
++        for (uint32_t y = 0; y < h; y++) {
++            const uint8_t *sp = guest + size_t(y) * d.pitch;
++            uint32_t *dp = depth + size_t(y) * w;
++            for (uint32_t x = 0; x < w; x++) {
++                uint16_t s;
++                std::memcpy(&s, sp + size_t(x) * 2, 2);
++                dp[x] = (uint32_t(s) << 8) + (uint32_t(s) + 128u) / 257u;
++            }
++        }
++    } else if (d.format == 0x2C) {  // D16 swizzled
++        for (uint32_t y = 0; y < h; y++) {
++            uint32_t yy = yo[y];
++            uint32_t *dp = depth + size_t(y) * w;
++            for (uint32_t x = 0; x < w; x++) {
++                uint16_t s;
++                std::memcpy(&s, guest + size_t(xo[x] | yy) * 2, 2);
++                dp[x] = (uint32_t(s) << 8) + (uint32_t(s) + 128u) / 257u;
++            }
++        }
++    } else {  // F24S8 / LIN_F24S8 / F16 / LIN_F16
++        auto float_depth = [&](const uint8_t *p, uint8_t &st) -> uint32_t {
+             if (has_stencil) {
+-                size_t address = size_t(y) * d.pitch + x * 4;
+-                if (!d.linear) {
+-                    uint32_t index = 0, outbit = 1;
+-                    for (uint32_t bit = 1; bit < d.width || bit < d.height; bit <<= 1) {
+-                        if (bit < d.width) {
+-                            if (x & bit)
+-                                index |= outbit;
+-                            outbit <<= 1;
+-                        }
+-                        if (bit < d.height) {
+-                            if (y & bit)
+-                                index |= outbit;
+-                            outbit <<= 1;
+-                        }
+-                    }
+-                    address = size_t(index) * 4;
+-                }
+-                stencil[i] = guest[address];
++                uint32_t v;
++                std::memcpy(&v, p, 4);
++                st = uint8_t(v);
++                uint32_t exp = v >> 24, man = (v >> 8) & 0xFFFFu;
++                float fv = std::bit_cast<float>(exp << 23 | man << 7);
++                return uint32_t(std::lround(std::clamp(fv, 0.0f, 1.0f) * 16777215.0f));
++            }
++            uint16_t s;
++            std::memcpy(&s, p, 2);
++            uint32_t exp = (s >> 12) + 120u, man = s & 0xFFFu;
++            float fv = std::bit_cast<float>(exp << 23 | man << 11) / 511.9375f;
++            return uint32_t(std::lround(std::clamp(fv, 0.0f, 1.0f) * 16777215.0f));
++        };
++        const uint32_t bpp = has_stencil ? 4 : 2;
++        if (d.linear) {
++            for (uint32_t y = 0; y < h; y++) {
++                const uint8_t *sp = guest + size_t(y) * d.pitch;
++                uint32_t *dp = depth + size_t(y) * w;
++                uint8_t *stp = stencil + size_t(y) * w;
++                for (uint32_t x = 0; x < w; x++) dp[x] = float_depth(sp + size_t(x) * bpp, stp[x]);
++            }
++        } else {
++            for (uint32_t y = 0; y < h; y++) {
++                uint32_t yy = yo[y];
++                uint32_t *dp = depth + size_t(y) * w;
++                uint8_t *stp = stencil + size_t(y) * w;
++                for (uint32_t x = 0; x < w; x++) dp[x] = float_depth(guest + size_t(xo[x] | yy) * bpp, stp[x]);
+             }
+         }
++    }
+     Layout(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     VkBufferImageCopy copy{};
      copy.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-     copy.imageExtent = {d.width, d.height, 1};
-     copy.bufferOffset = Upload(depth.data(), depth.size() * 4);
+-    copy.imageExtent = {d.width, d.height, 1};
+-    copy.bufferOffset = Upload(depth.data(), depth.size() * 4);
 -    vkCmdCopyBufferToImage(cmd_, arena_, image.image, image.layout, 1, &copy);
++    copy.imageExtent = {w, h, 1};
++    copy.bufferOffset = Upload(depth_u32_.data(), depth_u32_.size() * 4);
 +    vkCmdCopyBufferToImage(Cmd(), arena_, image.image, image.layout, 1, &copy);
      copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-     copy.bufferOffset = Upload(stencil.data(), stencil.size());
+-    copy.bufferOffset = Upload(stencil.data(), stencil.size());
 -    vkCmdCopyBufferToImage(cmd_, arena_, image.image, image.layout, 1, &copy);
 -    image.signature = Hash(guest, TotalSize(d));
++    copy.bufferOffset = Upload(stencil_u8_.data(), stencil_u8_.size());
 +    vkCmdCopyBufferToImage(Cmd(), arena_, image.image, image.layout, 1, &copy);
 +    image.signature = MemSig(d.data, TotalSize(d));
      image.epoch = DirtyEpoch(d.data);
      image.drawn = true;
-     LOG_FIRST(4, "vulkan: CPU depth imported %08X, %ux%u", d.data, d.width, d.height);
-@@ -605,8 +976,8 @@ Image *Vulkan::Target(const Surface &s, bool z) {
+-    LOG_FIRST(4, "vulkan: CPU depth imported %08X, %ux%u", d.data, d.width, d.height);
++    LOG_FIRST(4, "vulkan: CPU depth imported %08X, %ux%u", d.data, w, h);
+ }
+-Image *Vulkan::Target(const Surface &s, bool z) {
++Image *Vulkan::Target(const Surface &s, bool z, bool sync_dirty) {
+     if (!s.header)
+         return nullptr;
+     TextureDesc d;
+@@ -605,8 +1057,8 @@ Image *Vulkan::Target(const Surface &s, bool z) {
      uint64_t key = uint64_t(d.data) << 1 | uint64_t(z);
      auto &p = targets_[key];
      if (p && (p->w != d.width || p->h != d.height)) {
@@ -1086,7 +1431,7 @@ index fc93631..0903174 100644
              vkDestroyFramebuffer(device_, fb, nullptr);
          framebuffers_.clear();
          DestroyImage(*p);
-@@ -615,25 +986,34 @@ Image *Vulkan::Target(const Surface &s, bool z) {
+@@ -615,25 +1067,34 @@ Image *Vulkan::Target(const Surface &s, bool z) {
      if (!p) {
          p = MakeImage(d.width, d.height, 1, 1, 1, z ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_B8G8R8A8_UNORM, z, true);
          p->desc = d;
@@ -1119,7 +1464,7 @@ index fc93631..0903174 100644
 -            p->epoch = DirtyEpoch(d.data);
 -            p->drawn = false;
 +    uint64_t ep = DirtyEpoch(d.data);
-+    if (ep != p->epoch) {
++    if (sync_dirty && ep != p->epoch) {
 +        uint64_t sig = MemSig(d.data, TotalSize(d));
 +        p->epoch = ep;
 +        if (sig != p->signature) {
@@ -1134,7 +1479,7 @@ index fc93631..0903174 100644
          }
      }
      return p.get();
-@@ -644,44 +1024,66 @@ Image *Vulkan::Texture(uint32_t header, uint32_t palette) {
+@@ -644,44 +1105,66 @@ Image *Vulkan::Texture(uint32_t header, uint32_t palette) {
      TextureDesc d;
      if (!Describe(header, d))
          Fail("invalid texture");
@@ -1230,7 +1575,7 @@ index fc93631..0903174 100644
      return p.get();
  }
  VkSampler Vulkan::Sampler(const State &s, int stage, bool shadow) {
-@@ -813,6 +1215,11 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
+@@ -813,6 +1296,11 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
      auto it = shaders_.find(key);
      if (it != shaders_.end())
          return it->second;
@@ -1242,7 +1587,7 @@ index fc93631..0903174 100644
      auto dir = app::CacheDir() / "shader-cache-vulkan";
      std::filesystem::create_directories(dir);
      std::string name = std::to_string(key);
-@@ -876,11 +1283,12 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
+@@ -876,11 +1364,12 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
      auto size = f.tellg();
      if (size <= 0 || size % 4)
          Fail("invalid SPIR-V file");
@@ -1256,7 +1601,7 @@ index fc93631..0903174 100644
      VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
      ci.codeSize = words.size() * 4;
      ci.pCode = words.data();
-@@ -892,14 +1300,21 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
+@@ -892,14 +1381,21 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
  
  VkPipeline Vulkan::Pipeline(const State &s, const Assembled &a, VkRenderPass pass, bool color, bool depth, uint64_t vs,
                              uint64_t ps) {
@@ -1282,7 +1627,7 @@ index fc93631..0903174 100644
      auto it = pipelines_.find(key);
      if (it != pipelines_.end())
          return it->second;
-@@ -1116,14 +1531,20 @@ void Vulkan::Constants(const State &s, uint32_t w, uint32_t h, const TexInfo *in
+@@ -1116,14 +1612,20 @@ void Vulkan::Constants(const State &s, uint32_t w, uint32_t h, const TexInfo *in
  }
  
  void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t *indices) {
@@ -1306,7 +1651,7 @@ index fc93631..0903174 100644
      Image *rt = Target(s.rt, false);
      Image *ds = Target(s.zs, true);
      if (!rt && !ds)
-@@ -1133,37 +1554,78 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+@@ -1133,37 +1635,78 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
      for (int i = 0; i < 4; i++) {
          images[size_t(i)] = Texture(s.textures[size_t(i)], s.palettes[size_t(i)]);
          auto *t = images[size_t(i)];
@@ -1397,7 +1742,7 @@ index fc93631..0903174 100644
      uint32_t w = rt ? rt->w : ds->w, h = rt ? rt->h : ds->h;
      DrawConstants dc{};
      Constants(s, w, h, info, dc);
-@@ -1173,7 +1635,7 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+@@ -1173,7 +1716,7 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
          {arena_, Upload(s.vsc.data(), sizeof(s.vsc), size_t(alignment_)), sizeof(s.vsc)},
          {arena_, Upload(&dc, sizeof(dc), size_t(alignment_)), sizeof(dc)}};
      VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -1406,7 +1751,7 @@ index fc93631..0903174 100644
      ai.descriptorSetCount = 1;
      ai.pSetLayouts = &descriptors_;
      VkDescriptorSet set;
-@@ -1204,25 +1666,16 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+@@ -1204,25 +1747,16 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
      VkDeviceSize ib = 0;
      if (a.index_count)
          ib = Upload(a.index_src, size_t(a.index_count) * (a.index16 ? 2 : 4));
@@ -1439,7 +1784,7 @@ index fc93631..0903174 100644
      VkRect2D sc{{0, 0}, {fw, fh}};
      if (s.scissor_count) {
          if (s.scissor_count > 1)
-@@ -1238,45 +1691,79 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+@@ -1238,45 +1772,79 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
      int y1 = std::min(sc.offset.y + int(sc.extent.height),
                        int(std::min(uint64_t(s.viewport.y) + s.viewport.h, uint64_t(fh))));
      sc = {{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
@@ -1531,7 +1876,7 @@ index fc93631..0903174 100644
              rt->drawn = true;
          }
          if (ds) {
-@@ -1285,26 +1772,18 @@ void Vulkan::Clear(const State &s, uint32_t count, const uint8_t *rects, uint32_
+@@ -1285,26 +1853,18 @@ void Vulkan::Clear(const State &s, uint32_t count, const uint8_t *rects, uint32_
              VkImageAspectFlags aspects = ((flags & kClearZ) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
                                           ((flags & kClearStencil) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
              VkImageSubresourceRange r{aspects, 0, 1, 0, 1};
@@ -1562,7 +1907,7 @@ index fc93631..0903174 100644
      VkClearAttachment attachments[2]{};
      uint32_t n = 0;
      if (rt) {
-@@ -1327,12 +1806,13 @@ void Vulkan::Clear(const State &s, uint32_t count, const uint8_t *rects, uint32_
+@@ -1327,12 +1887,13 @@ void Vulkan::Clear(const State &s, uint32_t count, const uint8_t *rects, uint32_
          int x1 = std::clamp(r[2], x0, int(w)), y1 = std::clamp(r[3], y0, int(h));
          if (x1 > x0 && y1 > y0) {
              VkClearRect cr{{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, 0, 1};
@@ -1578,17 +1923,59 @@ index fc93631..0903174 100644
      LOG_FIRST(12, "vulkan: CopyRects src=%08X dst=%08X count=%u rects=%08X points=%08X", src.data, dst.data, count,
                rects, points);
      TextureDesc a, b;
-@@ -1350,8 +1830,16 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
+@@ -1348,10 +1909,56 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
+         }
+         if (!CopySurfaceMemory(src, dst, count, rects, points))
              Fail("unsupported CPU CopyRects format");
-         if (bz)
-             UploadDepth(*Target(dst, true), b);
+-        if (bz)
+-            UploadDepth(*Target(dst, true), b);
 -        else if (targets_.contains(uint64_t(b.data) << 1))
 -            Target(dst, false);
-+        else if (targets_.contains(uint64_t(b.data) << 1)) {
-+            Image *dt = Target(dst, false);
++        bool color_target = !bz && targets_.contains(uint64_t(b.data) << 1);
++        if (bz || color_target) {
++            Image *dt = Target(dst, bz, false);
 +            if (dt) {
-+                UploadImage(*dt, b);
-+                dt->signature = MemSig(b.data, TotalSize(b));
++                bool whole_copy = !count || !rects;
++                if (!whole_copy && count == 1 && rects) {
++                    int32_t r[4];
++                    std::memcpy(r, kernel::HostPtr(rects), 16);
++                    whole_copy = r[0] == 0 && r[1] == 0 && uint32_t(r[2]) >= b.width && uint32_t(r[3]) >= b.height;
++                }
++                uint64_t sig = MemSig(b.data, TotalSize(b));
++                uint64_t ckey = uint64_t(b.data) << 1 | uint64_t(bz);
++                auto &cached = copy_cache_[ckey];
++                VkFormat want_fmt = bz ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_B8G8R8A8_UNORM;
++                if (!cached || cached->w != b.width || cached->h != b.height || cached->format != want_fmt ||
++                    cached->z != bz) {
++                    if (cached)
++                        CurrentSlot().retire.push_back(std::move(cached));
++                    cached = MakeImage(b.width, b.height, 1, 1, 1, want_fmt, bz, false);
++                }
++                if (!whole_copy || cached->signature != sig || !SameTextureDesc(cached->desc, b)) {
++                    cached->desc = b;
++                    if (bz)
++                        UploadDepth(*cached, b);
++                    else
++                        UploadImage(*cached, b);
++                    cached->signature = whole_copy ? sig : ~sig;
++                    perf_.rtup++;
++                }
++                cached->used = frame_;
++                Layout(*cached, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++                Layout(*dt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++                EndRender();
++                uint32_t cw = std::min(cached->w, dt->w), ch = std::min(cached->h, dt->h);
++                VkImageCopy c{};
++                c.srcSubresource = c.dstSubresource = {
++                    bz ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT) : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT),
++                    0, 0, 1};
++                c.extent = {cw, ch, 1};
++                vkCmdCopyImage(Cmd(), cached->image, cached->layout, dt->image, dt->layout, 1, &c);
++                if (bz) {
++                    c.srcSubresource.aspectMask = c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++                    vkCmdCopyImage(Cmd(), cached->image, cached->layout, dt->image, dt->layout, 1, &c);
++                }
++                dt->signature = sig;
 +                dt->epoch = DirtyEpoch(b.data);
 +                dt->drawn = false;
 +            }
@@ -1597,7 +1984,7 @@ index fc93631..0903174 100644
          return;
      }
      Image *from = Target(src, az);
-@@ -1362,6 +1850,7 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
+@@ -1362,6 +1969,7 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
          Fail("overlapping CopyRects requires an intermediate image");
      Layout(*from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
      Layout(*to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -1605,7 +1992,7 @@ index fc93631..0903174 100644
      uint32_t copies = count && rects ? count : 1;
      for (uint32_t i = 0; i < copies; i++) {
          int32_t r[4] = {0, 0, int32_t(std::min(from->w, to->w)), int32_t(std::min(from->h, to->h))}, p[2] = {0, 0};
-@@ -1382,37 +1871,40 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
+@@ -1382,37 +1990,40 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
          c.srcOffset = {r[0], r[1], 0};
          c.dstOffset = {p[0], p[1], 0};
          c.extent = {uint32_t(r[2] - r[0]), uint32_t(r[3] - r[1]), 1};
@@ -1651,7 +2038,7 @@ index fc93631..0903174 100644
      auto &t = *it->second;
      std::vector<uint8_t> px;
      Read(t, px);
-@@ -1421,16 +1913,30 @@ void Vulkan::Sync(uint32_t data, uint32_t) {
+@@ -1421,16 +2032,30 @@ void Vulkan::Sync(uint32_t data, uint32_t) {
      auto *guest = static_cast<uint8_t *>(kernel::HostPtr(data));
      for (uint32_t y = 0; y < t.h; y++)
          std::memcpy(guest + size_t(y) * t.desc.pitch, px.data() + size_t(y) * t.w * 4, t.w * 4);
@@ -1689,7 +2076,7 @@ index fc93631..0903174 100644
  }
  void Vulkan::SetGamma(const uint8_t *ramp) {
      std::memcpy(gamma_, ramp, 768);
-@@ -1438,17 +1944,180 @@ void Vulkan::SetGamma(const uint8_t *ramp) {
+@@ -1438,17 +2063,180 @@ void Vulkan::SetGamma(const uint8_t *ramp) {
      for (int c = 0; c < 3; c++)
          for (int i = 0; i < 256; i++)
              gamma_identity_ &= ramp[c * 256 + i] == i;
@@ -1872,7 +2259,7 @@ index fc93631..0903174 100644
      if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
          Fail("swapchain transfer destination unavailable");
      uint32_t n = 0;
-@@ -1463,29 +2132,67 @@ void Vulkan::Resize() {
+@@ -1463,29 +2251,67 @@ void Vulkan::Resize() {
          }
      VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
      ci.surface = surface_;
@@ -1944,7 +2331,7 @@ index fc93631..0903174 100644
      if (swap_)
          vkDestroySwapchainKHR(device_, swap_, nullptr);
      swap_ = next;
-@@ -1494,7 +2201,12 @@ void Vulkan::Resize() {
+@@ -1494,7 +2320,12 @@ void Vulkan::Resize() {
      Check(vkGetSwapchainImagesKHR(device_, swap_, &n, nullptr), "swapchain images");
      swap_images_.resize(n);
      Check(vkGetSwapchainImagesKHR(device_, swap_, &n, swap_images_.data()), "swapchain images");
@@ -1958,7 +2345,7 @@ index fc93631..0903174 100644
  }
  void Vulkan::Capture(Image &t) {
      auto dir = diag::CaptureDir();
-@@ -1511,6 +2223,20 @@ void Vulkan::Capture(Image &t) {
+@@ -1511,6 +2342,20 @@ void Vulkan::Capture(Image &t) {
      LOGR("vulkan: captured %s", file.c_str());
  }
  void Vulkan::Present(const Surface &front) {
@@ -1979,7 +2366,7 @@ index fc93631..0903174 100644
      Image *t = Target(front, false);
      if (!t)
          Fail("present has no front surface");
-@@ -1519,37 +2245,75 @@ void Vulkan::Present(const Surface &front) {
+@@ -1519,37 +2364,75 @@ void Vulkan::Present(const Surface &front) {
      Resize();
      auto size = app::LinuxWindowSize();
      if (!swap_ || !size.width || !size.height) {
@@ -2076,7 +2463,7 @@ index fc93631..0903174 100644
      Image back;
      back.image = swap_images_[index];
      back.w = extent_.width;
-@@ -1558,7 +2322,7 @@ void Vulkan::Present(const Surface &front) {
+@@ -1558,7 +2441,7 @@ void Vulkan::Present(const Surface &front) {
      Layout(back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
      VkClearColorValue black{};
      VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -2085,7 +2472,7 @@ index fc93631..0903174 100644
      float aspect = app::FrameAspect();
      int w = int(extent_.width), h = int(extent_.height);
      if (aspect > 0) {
-@@ -1576,23 +2340,53 @@ void Vulkan::Present(const Surface &front) {
+@@ -1576,23 +2459,53 @@ void Vulkan::Present(const Surface &front) {
      blit.srcOffsets[1] = {int(source.w) - cx, int(source.h) - cy, 1};
      blit.dstOffsets[0] = {x, y, 0};
      blit.dstOffsets[1] = {x + w, y + h, 1};
@@ -2147,7 +2534,7 @@ index fc93631..0903174 100644
      for (auto it = textures_.begin(); it != textures_.end();)
          if (frame_ - it->second->used > 120) {
              DestroyImage(*it->second);
-@@ -1608,32 +2402,47 @@ Vulkan::~Vulkan() {
+@@ -1608,32 +2521,49 @@ Vulkan::~Vulkan() {
          vkDestroyFramebuffer(device_, v, nullptr);
      for (auto [k, v] : pipelines_)
          vkDestroyPipeline(device_, v, nullptr);
@@ -2167,6 +2554,8 @@ index fc93631..0903174 100644
          DestroyImage(*v);
 -    for (auto &t : transient_)
 -        DestroyImage(*t);
++    for (auto &[k, v] : copy_cache_)
++        DestroyImage(*v);
 +    for (auto &slot : slots_) {
 +        for (auto &t : slot.retire)
 +            DestroyImage(*t);
@@ -2201,6 +2590,18 @@ index fc93631..0903174 100644
      vkDestroyDevice(device_, nullptr);
      vkDestroySurfaceKHR(instance_, surface_, nullptr);
      vkDestroyInstance(instance_, nullptr);
+@@ -1642,8 +2572,10 @@ Vulkan::~Vulkan() {
+ std::unique_ptr<Backend> CreateBackend() {
+     return std::make_unique<Vulkan>();
+ }
+-// The experimental backend executes guest calls in order on the caller's guest thread.
++#ifndef __ANDROID__
++// The experimental desktop Linux build executes guest calls in order on the caller's guest thread.
+ std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner) {
+     return inner;
+ }
++#endif
+ } // namespace gpu
 diff --git a/sdk/runtime/xdk/fiber.cpp b/sdk/runtime/xdk/fiber.cpp
 index a1b300e..a22bf8a 100644
 --- a/sdk/runtime/xdk/fiber.cpp
