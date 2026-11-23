@@ -1,26 +1,94 @@
-# genma-recomp-android
+# Genma Onimusha — Android ARM64 Port
 
-Port native Android ARM64 (API 29+, Vulkan) untuk **Genma Onimusha** (original Xbox), hasil adaptasi dari upstream [`rafaelkenedy/genma-recomp`](https://github.com/rafaelkenedy/genma-recomp) dengan mekanisme *game loader*, SDL3 activity, dan *in-process* glslang shader pipeline mengikuti arsitektur [`RanggaCasper/Black-Android`](https://github.com/RanggaCasper/Black-Android).
+[![Build & Release Android APK (ARM64)](https://github.com/EkoSaputro14/genma-recomp-android/actions/workflows/build-android.yml/badge.svg)](https://github.com/EkoSaputro14/genma-recomp-android/actions/workflows/build-android.yml)
+[![Latest Release](https://img.shields.io/github/v/release/EkoSaputro14/genma-recomp-android?include_prereleases&label=Release&color=blue)](https://github.com/EkoSaputro14/genma-recomp-android/releases/latest)
+[![Platform](https://img.shields.io/badge/Android-10%2B%20(ARM64%20%7C%20Vulkan%201.1)-3DDC84?logo=android&logoColor=white)](https://github.com/EkoSaputro14/genma-recomp-android/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/EkoSaputro14/genma-recomp-android?style=social)](https://github.com/EkoSaputro14/genma-recomp-android/stargazers)
 
-> [!NOTE]
-> Repositori ini tidak menyediakan aset game terbuka. Pengguna wajib menyediakan salinan legal *Genma Onimusha (USA)* sendiri (`.iso` atau `default.xbe` + folder data).
+> **Experimental native ARM64 static recompilation port of *Genma Onimusha* (Original Xbox) for Android powered by SDL3 + Vulkan.**
+>
+> Help test compatibility across **MediaTek (Mali / Immortalis)**, **Samsung Exynos**, **Google Tensor**, and **Qualcomm Snapdragon (Adreno)** devices! If this project interests you, consider giving it a **Star** ⭐ and submitting a [Device Test Report](https://github.com/EkoSaputro14/genma-recomp-android/issues/new?template=device_test_report.yml).
 
-## Cara Memuat Game di Android (Pola Black-Android)
+---
 
-1. Pasang APK dari **GitHub Releases**.
-2. Buka **Genma Onimusha** dan izinkan **All Files Access** (Android 11+) atau izin **Storage** (Android 10).
-3. Pilih salah satu metode berikut:
-   - **Import langsung dari aplikasi**: ketuk **Import game** pada dialog awal dan pilih berkas `.iso` dari *Downloads*, SD card, USB OTG, atau penyimpanan cloud. Aplikasi memvalidasi header XDVDFS (`MICROSOFT*XBOX*MEDIA`) dan menyalin secara atomik (`.part` → `.iso`).
-   - **Salin manual**: letakkan `.iso` atau `default.xbe` beserta folder datanya di `/storage/emulated/0/GenmaOnimusha`, folder `GenmaOnimusha` di root SD card, atau `Android/data/com.genmarecomp.android/files/assets`.
-4. Native `app::FindGame()` memindai folder game tiap detik secara otomatis—begitu file tersedia, game langsung *boot* tanpa perlu restart APK.
+## Highlights & Android Architecture
 
-## Arsitektur Teknis
+- **Static Recompilation (Not an Emulator)**: Runs natively compiled ARM64 C++20 code generated from `default.xbe` via [`rafaelkenedy/genma-recomp`](https://github.com/rafaelkenedy/genma-recomp), paired with an XDK/kernel runtime and Vulkan GPU backend.
+- **Dedicated Async Vulkan Render Thread (`v0.8.0-android.7+`)**: Decouples Vulkan command encoding/presentation from x86 CPU game simulation threads, paired with `copy_cache_` snapshot reuse and integer depth upload optimizations.
+- **ARM Mali / Immortalis / Exynos Compatibility (`v0.8.0-android.8`)**:
+  - Automatic fallback from `VK_FORMAT_D24_UNORM_S8_UINT` to `VK_FORMAT_D32_SFLOAT_S8_UINT` when a GPU driver does not support packed 24-bit depth-stencil sampling/attachments (common on ARM Mali, Immortalis, and Exynos).
+  - Non-sRGB swapchain preference (`VK_FORMAT_B8G8R8A8_UNORM` -> `VK_FORMAT_R8G8B8A8_UNORM`) before falling back to driver default, avoiding washed-out double-gamma presentation.
+  - CPU DXT1/DXT3/DXT5 texture decode fallback when hardware BC texture compression is unavailable (`vulkan: BC textures unavailable`).
+- **Built-in Touch Controls + Gamepad Support**: Multi-touch virtual Xbox overlay (`Stick`, `D-Pad`, `A/B/X/Y`, `LB/LT/RB/RT`, `BACK/START`, and `PAD` visibility toggle) plus SDL3 & Android OEM controller support.
 
-- **Unified Native Library (`libmain.so` + `libSDL3.so`)**: dibangun dari satu root [CMakeLists.txt](CMakeLists.txt) yang menyatukan `sdk/runtime` portable, hook game `src/`, host Android `native/`, dan 32 partisi hasil `xbe_recomp` (`generated/game/`).
-- **Vulkan Mobile Compatibility**: kompilasi HLSL → SPIR-V berjalan *in-process* melalui `glslang` ([native/vk_shader.cpp](native/vk_shader.cpp)) dengan *disk cache* (menggantikan `posix_spawnp("dxc")`), dilengkapi CPU DXT1/3/5 decode fallback untuk GPU mobile tanpa `textureCompressionBC` dan penanganan *surface epoch* saat *background/foreground*.
-- **ARM64 Bionic Fiber**: context switcher AAPCS64 BTI-safe ([sdk/runtime/xdk/fiber_android.h](sdk/runtime/xdk/fiber_android.h)) yang diaktifkan otomatis oleh `sdk/runtime/xdk/fiber.cpp` pada `#ifdef __ANDROID__`.
-- **Input**: dukungan penuh gamepad Bluetooth/USB via SDL3, jembatan *loose OEM controller* (MIUI/virtualized pad), serta *touch overlay* virtual.
+---
 
-## Build Lokal & CI
+## Quick Start (English)
 
-Lihat panduan lengkap di [docs/android-port-guide.md](docs/android-port-guide.md).
+1. **Download the APK**
+   - Grab the latest `GenmaOnimusha-v*-android-arm64-v8a.apk` from [**GitHub Releases**](https://github.com/EkoSaputro14/genma-recomp-android/releases/latest) (verify with `SHA256SUMS` if desired).
+   - Requirements: **Android 10+ (API 29+)**, **ARM64 (`arm64-v8a`)**, **Vulkan 1.1+**.
+2. **Prepare Your Own Game Copy** *(No copyrighted assets included)*
+   - Use your own legal dump of *Genma Onimusha* (Original Xbox): either a disc image (`.iso` / `.xiso`) or extracted `default.xbe` with game asset folders.
+   - Put the game files in one of these locations:
+     - `/sdcard/GenmaOnimusha/` (recommended — grant *All files access* when prompted, or use the in-app **ISO Importer** picker), **or**
+     - `/sdcard/Android/data/com.genmarecomp.android/files/assets/`, **or**
+     - `GenmaOnimusha/` at the root of an SD card / USB OTG drive.
+3. **Launch & Play**
+   - Once the game image or `default.xbe` is detected, booting begins automatically.
+   - Tap `PAD` at the top-center of the screen to show/hide the translucent virtual Xbox controller overlay, or pair a Bluetooth/USB controller.
+
+---
+
+## Device Compatibility Matrix (Call for Testers!)
+
+We are actively collecting test reports — **especially on MediaTek Dimensity/Helio (Mali & Immortalis), Samsung Exynos, and Google Tensor** devices in `v0.8.0-android.8`+!
+
+| Device Model | SoC / GPU | Android Version | APK Version | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Xiaomi POCO X3 NFC (`M2007J20CG`) | Snapdragon 732G (`SM7150`) / Adreno 618 | Android 12 (API 31) | `v0.8.0-android.7` | Playable (up to 60 FPS) | Verified with CPU BC decode fallback; minor scene-dependent slowdowns remain |
+| MediaTek Dimensity / Helio | Mali / Immortalis | Android 10–15 | `v0.8.0-android.8` | **Untested — Testers Needed!** | Needs verification for `D32_SFLOAT_S8_UINT` depth-stencil & `R8G8B8A8_UNORM` swapchain |
+| Samsung Galaxy (Exynos) | Mali / Xclipse | Android 10–15 | `v0.8.0-android.8` | **Untested — Testers Needed!** | Needs `genma.log` & visual feedback |
+| Google Pixel (Tensor) | Mali / Immortalis | Android 12–15 | `v0.8.0-android.8` | **Untested — Testers Needed!** | Needs `genma.log` & visual feedback |
+| Snapdragon 6xx / 7xx / 8xx (Adreno) | Adreno 6xx / 7xx | Android 10–15 | `v0.8.0-android.8` | **Partially Tested** | Report FPS & scene performance on newer Adreno GPUs |
+
+👉 **Tested on your phone?** Please open a [**Device Test Report**](https://github.com/EkoSaputro14/genma-recomp-android/issues/new?template=device_test_report.yml) with your SoC/GPU model and `genma.log`!
+
+---
+
+## How to Collect `genma.log` for Bug Reports
+
+Every run writes a diagnostic log automatically on Android:
+
+- **Log path on device**:
+  `/sdcard/Android/data/com.genmarecomp.android/files/logs/genma.log`
+- You can retrieve it using:
+  - **File manager** with `Android/data` access (e.g., ZArchiver / Solid Explorer / MT Manager), or
+  - **PC via ADB**:
+    ```bash
+    adb pull /sdcard/Android/data/com.genmarecomp.android/files/logs/genma.log .
+    ```
+- Key lines helpful for diagnosis include `Device:`, `CPU:`, `vulkan: depth format ...`, `vulkan: swapchain ...`, and the `fps=...` performance lines.
+
+---
+
+## Panduan Singkat (Bahasa Indonesia)
+
+Porting native ARM64 berbasis static recompilation untuk game Original Xbox ***Genma Onimusha*** di Android (SDL3 + Vulkan). Ini bukan emulator berat — kode game dikompilasi ke native ARM64 (`libmain.so`).
+
+1. **Unduh APK**: Ambil `GenmaOnimusha-v*-android-arm64-v8a.apk` dari halaman [**Releases**](https://github.com/EkoSaputro14/genma-recomp-android/releases/latest) (wajib Android 10+ ARM64 dengan Vulkan 1.1+).
+2. **Siapkan File Game Milik Pribadi**: Letakkan file `.iso` / `.xiso` atau folder berisi `default.xbe` ke `/sdcard/GenmaOnimusha/` atau `/sdcard/Android/data/com.genmarecomp.android/files/assets/` (atau pilih lewat menu import ISO di aplikasi).
+3. **Bantu Testing Multi-Device**: Rilis **`v0.8.0-android.8`** menambahkan fallback GPU `VK_FORMAT_D32_SFLOAT_S8_UINT` serta prioritas swapchain non-sRGB khusus agar GPU **MediaTek (Mali/Immortalis)** dan **Samsung Exynos** bisa berjalan.
+4. **Kirim Laporan & Log**: Ambil log dari `/sdcard/Android/data/com.genmarecomp.android/files/logs/genma.log` lalu kirim lewat template [**Device Test Report**](https://github.com/EkoSaputro14/genma-recomp-android/issues/new?template=device_test_report.yml). Jangan lupa kasih ⭐ **Star** jika proyek ini bermanfaat!
+
+---
+
+## Credits & Acknowledgments
+
+- **Upstream Recompiler & Runtime**: [`rafaelkenedy/genma-recomp`](https://github.com/rafaelkenedy/genma-recomp) (pinned commit `33fee19ef4aec490b8970d4472fadd6c4bc99aa2` in [`tools/sync_upstream.sh`](tools/sync_upstream.sh)).
+- **Android Unified Build / SDL3 / Vulkan Shader Bridge Architecture**: Inspired by [`RanggaCasper/Black-Android`](https://github.com/RanggaCasper/Black-Android).
+- **Dependencies**: SDL3 (`release-3.4.16`), Khronos `glslang` (`16.0.0`), `toml++` (`v3.4.0`), Android NDK (`27.2.12479018`).
+
+## Legal Disclaimer
+
+This repository contains **source code, build scripts, and Android compatibility patches only**. It does **not** distribute copyrighted game binaries, Xbox BIOS images, keys, or disc assets. Users must supply their own legally obtained copy of *Genma Onimusha* to run the application.

@@ -1,0 +1,74 @@
+name: Device Compatibility / Test Report
+description: Report Android test results (MediaTek Mali/Immortalis, Exynos, Snapdragon, etc.)
+title: "[Device Test] <Device Model> (<SoC / GPU>)"
+labels: ["device-test", "testing"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing **Genma Onimusha Android ARM64**!
+        Please fill in the fields below and attach your `genma.log` file so GPU/CPU issues can be diagnosed accurately.
+  - type: input
+    id: apk_version
+    attributes:
+      label: APK Release Version
+      description: Version downloaded from GitHub Releases
+      placeholder: "v0.8.0-android.8"
+    validations:
+      required: true
+  - type: input
+    id: device_model
+    attributes:
+      label: Device Model & Android Version
+      placeholder: "e.g., Redmi Note 13 Pro / POCO X6 / Galaxy A54 (Android 14)"
+    validations:
+      required: true
+  - type: dropdown
+    id: gpu_family
+    attributes:
+      label: SoC & GPU Family
+      options:
+        - MediaTek Dimensity / Helio (ARM Mali / Immortalis)
+        - Qualcomm Snapdragon (Adreno)
+        - Samsung Exynos (Mali / Xclipse RDNA)
+        - Google Tensor (Mali / Immortalis)
+        - Other / Unsure
+    validations:
+      required: true
+  - type: input
+    id: soc_gpu_exact
+    attributes:
+      label: Exact SoC & GPU (if known)
+      placeholder: "e.g., Dimensity 8300-Ultra (Mali-G615 MC6) or Snapdragon 732G (Adreno 618)"
+    validations:
+      required: false
+  - type: dropdown
+    id: boot_status
+    attributes:
+      label: Boot & Gameplay Status
+      options:
+        - Bootable & Playable (60fps / smooth)
+        - Bootable with slowdowns / low FPS
+        - Boots with graphical / texture glitches
+        - Black screen or crashes on startup
+        - Fails to detect ISO / default.xbe
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Observations (FPS, Glitches, Audio, Controls)
+      description: Describe which scenes slow down, whether touch overlay / gamepad works, and any rendering artifacts.
+      placeholder: "Intro FMV works, courtyard scene drops FPS, shadow/depth looks..."
+    validations:
+      required: true
+  - type: textarea
+    id: log_excerpt
+    attributes:
+      label: genma.log Excerpt or Attachment
+      description: |
+        Paste key lines from `genma.log` (especially `vulkan:` lines) or drag-and-drop the `genma.log` file here.
+        Path on Android: `/sdcard/Android/data/com.genmarecomp.android/files/logs/genma.log` (often accessible via ADB or a file manager with Android/data access).
+      render: text
+    validations:
+      required: false

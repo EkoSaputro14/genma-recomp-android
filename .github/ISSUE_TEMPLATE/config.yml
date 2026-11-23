@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Upstream Recompiler (rafaelkenedy/genma-recomp)
+    url: https://github.com/rafaelkenedy/genma-recomp
+    about: Upstream Windows/Xbox static recompilation project
+  - name: Releases & APK Downloads
+    url: https://github.com/EkoSaputro14/genma-recomp-android/releases
+    about: Download the latest signed ARM64 APK before testing
