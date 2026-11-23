@@ -488,7 +488,7 @@ index 3ebd900..70eb733 100644
          out.elements[size_t(inputs.regs[k])] = {DXGI_FORMAT_R32G32B32A32_FLOAT, 0, uint16_t(k * 16)};
      }
 diff --git a/sdk/runtime/gpu/vulkan.cpp b/sdk/runtime/gpu/vulkan.cpp
-index fc93631..3c9d6cf 100644
+index fc93631..5f15c22 100644
 --- a/sdk/runtime/gpu/vulkan.cpp
 +++ b/sdk/runtime/gpu/vulkan.cpp
 @@ -5,6 +5,7 @@
@@ -1157,7 +1157,7 @@ index fc93631..3c9d6cf 100644
  void Vulkan::Layout(Image &t, VkImageLayout layout) {
      Begin();
 -    // Include a memory dependency even when layout stays unchanged (successive render passes).
-+    if (t.layout == layout)
++    if (t.layout == layout && layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
 +        return;
 +    EndRender();
 +    VkPipelineStageFlags src_stage = 0, dst_stage = 0;
@@ -1639,7 +1639,43 @@ index fc93631..3c9d6cf 100644
          a[n].samples = VK_SAMPLE_COUNT_1_BIT;
          a[n].loadOp = a[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
          a[n].storeOp = a[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-@@ -813,6 +1349,11 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
+@@ -743,11 +1279,35 @@ VkRenderPass Vulkan::Pass(bool color, bool depth) {
+     sub.colorAttachmentCount = color ? 1 : 0;
+     sub.pColorAttachments = color ? &cr : nullptr;
+     sub.pDepthStencilAttachment = depth ? &dr : nullptr;
++    VkPipelineStageFlags dep_stage = (color ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : 0) |
++                                     (depth ? (VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
++                                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT) : 0);
++    VkAccessFlags dep_write = (color ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0) |
++                              (depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : 0);
++    VkAccessFlags dep_rw = (color ? (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
++                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT) : 0) |
++                           (depth ? (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
++                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) : 0);
++    VkSubpassDependency deps[2]{};
++    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
++    deps[0].dstSubpass = 0;
++    deps[0].srcStageMask = dep_stage;
++    deps[0].dstStageMask = dep_stage;
++    deps[0].srcAccessMask = dep_write;
++    deps[0].dstAccessMask = dep_rw;
++    deps[1].srcSubpass = 0;
++    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
++    deps[1].srcStageMask = dep_stage;
++    deps[1].dstStageMask = dep_stage;
++    deps[1].srcAccessMask = dep_write;
++    deps[1].dstAccessMask = dep_rw;
+     VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+     ci.attachmentCount = n;
+     ci.pAttachments = a;
+     ci.subpassCount = 1;
+     ci.pSubpasses = &sub;
++    ci.dependencyCount = dep_stage ? 2u : 0u;
++    ci.pDependencies = dep_stage ? deps : nullptr;
+     VkRenderPass pass;
+     Check(vkCreateRenderPass(device_, &ci, nullptr, &pass), "render pass");
+     passes_[key] = pass;
+@@ -813,6 +1373,11 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
      auto it = shaders_.find(key);
      if (it != shaders_.end())
          return it->second;
@@ -1651,7 +1687,7 @@ index fc93631..3c9d6cf 100644
      auto dir = app::CacheDir() / "shader-cache-vulkan";
      std::filesystem::create_directories(dir);
      std::string name = std::to_string(key);
-@@ -876,11 +1417,12 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
+@@ -876,11 +1441,12 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
      auto size = f.tellg();
      if (size <= 0 || size % 4)
          Fail("invalid SPIR-V file");
@@ -1665,7 +1701,7 @@ index fc93631..3c9d6cf 100644
      VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
      ci.codeSize = words.size() * 4;
      ci.pCode = words.data();
-@@ -892,14 +1434,21 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
+@@ -892,14 +1458,21 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
  
  VkPipeline Vulkan::Pipeline(const State &s, const Assembled &a, VkRenderPass pass, bool color, bool depth, uint64_t vs,
                              uint64_t ps) {
@@ -1691,7 +1727,7 @@ index fc93631..3c9d6cf 100644
      auto it = pipelines_.find(key);
      if (it != pipelines_.end())
          return it->second;
-@@ -1116,14 +1665,20 @@ void Vulkan::Constants(const State &s, uint32_t w, uint32_t h, const TexInfo *in
+@@ -1116,14 +1689,20 @@ void Vulkan::Constants(const State &s, uint32_t w, uint32_t h, const TexInfo *in
  }
  
  void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t *indices) {
@@ -1715,7 +1751,7 @@ index fc93631..3c9d6cf 100644
      Image *rt = Target(s.rt, false);
      Image *ds = Target(s.zs, true);
      if (!rt && !ds)
-@@ -1133,37 +1688,78 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+@@ -1133,37 +1712,78 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
      for (int i = 0; i < 4; i++) {
          images[size_t(i)] = Texture(s.textures[size_t(i)], s.palettes[size_t(i)]);
          auto *t = images[size_t(i)];
@@ -1806,7 +1842,7 @@ index fc93631..3c9d6cf 100644
      uint32_t w = rt ? rt->w : ds->w, h = rt ? rt->h : ds->h;
      DrawConstants dc{};
      Constants(s, w, h, info, dc);
-@@ -1173,7 +1769,7 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+@@ -1173,7 +1793,7 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
          {arena_, Upload(s.vsc.data(), sizeof(s.vsc), size_t(alignment_)), sizeof(s.vsc)},
          {arena_, Upload(&dc, sizeof(dc), size_t(alignment_)), sizeof(dc)}};
      VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -1815,7 +1851,7 @@ index fc93631..3c9d6cf 100644
      ai.descriptorSetCount = 1;
      ai.pSetLayouts = &descriptors_;
      VkDescriptorSet set;
-@@ -1204,25 +1800,16 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+@@ -1204,25 +1824,16 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
      VkDeviceSize ib = 0;
      if (a.index_count)
          ib = Upload(a.index_src, size_t(a.index_count) * (a.index16 ? 2 : 4));
@@ -1848,7 +1884,7 @@ index fc93631..3c9d6cf 100644
      VkRect2D sc{{0, 0}, {fw, fh}};
      if (s.scissor_count) {
          if (s.scissor_count > 1)
-@@ -1238,45 +1825,79 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+@@ -1238,45 +1849,79 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
      int y1 = std::min(sc.offset.y + int(sc.extent.height),
                        int(std::min(uint64_t(s.viewport.y) + s.viewport.h, uint64_t(fh))));
      sc = {{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
@@ -1940,7 +1976,7 @@ index fc93631..3c9d6cf 100644
              rt->drawn = true;
          }
          if (ds) {
-@@ -1285,26 +1906,18 @@ void Vulkan::Clear(const State &s, uint32_t count, const uint8_t *rects, uint32_
+@@ -1285,26 +1930,18 @@ void Vulkan::Clear(const State &s, uint32_t count, const uint8_t *rects, uint32_
              VkImageAspectFlags aspects = ((flags & kClearZ) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
                                           ((flags & kClearStencil) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
              VkImageSubresourceRange r{aspects, 0, 1, 0, 1};
@@ -1971,7 +2007,7 @@ index fc93631..3c9d6cf 100644
      VkClearAttachment attachments[2]{};
      uint32_t n = 0;
      if (rt) {
-@@ -1327,12 +1940,13 @@ void Vulkan::Clear(const State &s, uint32_t count, const uint8_t *rects, uint32_
+@@ -1327,12 +1964,13 @@ void Vulkan::Clear(const State &s, uint32_t count, const uint8_t *rects, uint32_
          int x1 = std::clamp(r[2], x0, int(w)), y1 = std::clamp(r[3], y0, int(h));
          if (x1 > x0 && y1 > y0) {
              VkClearRect cr{{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, 0, 1};
@@ -1987,7 +2023,7 @@ index fc93631..3c9d6cf 100644
      LOG_FIRST(12, "vulkan: CopyRects src=%08X dst=%08X count=%u rects=%08X points=%08X", src.data, dst.data, count,
                rects, points);
      TextureDesc a, b;
-@@ -1348,10 +1962,56 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
+@@ -1348,10 +1986,56 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
          }
          if (!CopySurfaceMemory(src, dst, count, rects, points))
              Fail("unsupported CPU CopyRects format");
@@ -2048,7 +2084,7 @@ index fc93631..3c9d6cf 100644
          return;
      }
      Image *from = Target(src, az);
-@@ -1362,6 +2022,7 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
+@@ -1362,6 +2046,7 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
          Fail("overlapping CopyRects requires an intermediate image");
      Layout(*from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
      Layout(*to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -2056,7 +2092,7 @@ index fc93631..3c9d6cf 100644
      uint32_t copies = count && rects ? count : 1;
      for (uint32_t i = 0; i < copies; i++) {
          int32_t r[4] = {0, 0, int32_t(std::min(from->w, to->w)), int32_t(std::min(from->h, to->h))}, p[2] = {0, 0};
-@@ -1382,37 +2043,40 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
+@@ -1382,37 +2067,40 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
          c.srcOffset = {r[0], r[1], 0};
          c.dstOffset = {p[0], p[1], 0};
          c.extent = {uint32_t(r[2] - r[0]), uint32_t(r[3] - r[1]), 1};
@@ -2102,7 +2138,7 @@ index fc93631..3c9d6cf 100644
      auto &t = *it->second;
      std::vector<uint8_t> px;
      Read(t, px);
-@@ -1421,16 +2085,30 @@ void Vulkan::Sync(uint32_t data, uint32_t) {
+@@ -1421,16 +2109,30 @@ void Vulkan::Sync(uint32_t data, uint32_t) {
      auto *guest = static_cast<uint8_t *>(kernel::HostPtr(data));
      for (uint32_t y = 0; y < t.h; y++)
          std::memcpy(guest + size_t(y) * t.desc.pitch, px.data() + size_t(y) * t.w * 4, t.w * 4);
@@ -2140,7 +2176,7 @@ index fc93631..3c9d6cf 100644
  }
  void Vulkan::SetGamma(const uint8_t *ramp) {
      std::memcpy(gamma_, ramp, 768);
-@@ -1438,17 +2116,180 @@ void Vulkan::SetGamma(const uint8_t *ramp) {
+@@ -1438,17 +2140,184 @@ void Vulkan::SetGamma(const uint8_t *ramp) {
      for (int c = 0; c < 3; c++)
          for (int i = 0; i < 256; i++)
              gamma_identity_ &= ramp[c * 256 + i] == i;
@@ -2286,7 +2322,11 @@ index fc93631..3c9d6cf 100644
 +        host::WaitForeground();
 +    }
 +    if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window *>(app::Window()), instance_, nullptr, &surface_)) {
-+        LOGW("vulkan: SDL_Vulkan_CreateSurface deferred: %s", SDL_GetError());
++        static int deferred_logs = 0;
++        if (deferred_logs < 8) {
++            deferred_logs++;
++            LOGR("vulkan: SDL_Vulkan_CreateSurface deferred: %s", SDL_GetError());
++        }
 +        surface_lost_ = true;
 +        return false;
 +    }
@@ -2323,7 +2363,7 @@ index fc93631..3c9d6cf 100644
      if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
          Fail("swapchain transfer destination unavailable");
      uint32_t n = 0;
-@@ -1456,36 +2297,78 @@ void Vulkan::Resize() {
+@@ -1456,36 +2325,78 @@ void Vulkan::Resize() {
      std::vector<VkSurfaceFormatKHR> formats(n);
      Check(vkGetPhysicalDeviceSurfaceFormatsKHR(physical_, surface_, &n, formats.data()), "surface formats");
      auto choice = formats.front();
@@ -2407,7 +2447,7 @@ index fc93631..3c9d6cf 100644
      if (swap_)
          vkDestroySwapchainKHR(device_, swap_, nullptr);
      swap_ = next;
-@@ -1494,7 +2377,12 @@ void Vulkan::Resize() {
+@@ -1494,7 +2405,15 @@ void Vulkan::Resize() {
      Check(vkGetSwapchainImagesKHR(device_, swap_, &n, nullptr), "swapchain images");
      swap_images_.resize(n);
      Check(vkGetSwapchainImagesKHR(device_, swap_, &n, swap_images_.data()), "swapchain images");
@@ -2416,12 +2456,15 @@ index fc93631..3c9d6cf 100644
 +    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
 +    for (uint32_t i = 0; i < n; i++)
 +        Check(vkCreateSemaphore(device_, &sci, nullptr, &swap_done_[i]), "present semaphore");
-+    LOGR("vulkan: swapchain %ux%u (fmt=%d, transform=0x%X, current=0x%X)", extent_.width, extent_.height,
-+         int(swap_format_), unsigned(ci.preTransform), unsigned(caps.currentTransform));
++    VkFormatProperties sfp{};
++    vkGetPhysicalDeviceFormatProperties(physical_, swap_format_, &sfp);
++    LOGR("vulkan: swapchain %ux%u (fmt=%d, blit_dst=%d, transform=0x%X, current=0x%X)", extent_.width, extent_.height,
++         int(swap_format_), int((sfp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0),
++         unsigned(ci.preTransform), unsigned(caps.currentTransform));
  }
  void Vulkan::Capture(Image &t) {
      auto dir = diag::CaptureDir();
-@@ -1511,6 +2399,20 @@ void Vulkan::Capture(Image &t) {
+@@ -1511,6 +2430,20 @@ void Vulkan::Capture(Image &t) {
      LOGR("vulkan: captured %s", file.c_str());
  }
  void Vulkan::Present(const Surface &front) {
@@ -2442,7 +2485,7 @@ index fc93631..3c9d6cf 100644
      Image *t = Target(front, false);
      if (!t)
          Fail("present has no front surface");
-@@ -1519,37 +2421,75 @@ void Vulkan::Present(const Surface &front) {
+@@ -1519,46 +2452,120 @@ void Vulkan::Present(const Surface &front) {
      Resize();
      auto size = app::LinuxWindowSize();
      if (!swap_ || !size.width || !size.height) {
@@ -2501,15 +2544,25 @@ index fc93631..3c9d6cf 100644
      uint32_t index = 0;
 -    VkResult result = vkAcquireNextImageKHR(device_, swap_, 30000000000ull, acquired_, VK_NULL_HANDLE, &index);
 +    VkResult result = vkAcquireNextImageKHR(device_, swap_, 30000000000ull, f.acquired, VK_NULL_HANDLE, &index);
++    VkResult acq_res = result;
 +#ifdef __ANDROID__
 +    if (result == VK_ERROR_SURFACE_LOST_KHR) {
-+        LOGW("vulkan: acquire surface lost, scheduling recreate");
++        static int acq_lost_logs = 0;
++        if (acq_lost_logs < 8) {
++            acq_lost_logs++;
++            LOGR("vulkan: acquire surface lost, scheduling recreate");
++        }
 +        surface_lost_ = true;
 +        Submit(true);
 +        return;
 +    }
 +#endif
      if (result == VK_ERROR_OUT_OF_DATE_KHR) {
++        static int acq_ood_logs = 0;
++        if (acq_ood_logs < 8) {
++            acq_ood_logs++;
++            LOGR("vulkan: acquire out of date, resizing swapchain");
++        }
 +        Submit(true);
          extent_ = {};
          Resize();
@@ -2539,16 +2592,44 @@ index fc93631..3c9d6cf 100644
      Image back;
      back.image = swap_images_[index];
      back.w = extent_.width;
-@@ -1558,7 +2498,7 @@ void Vulkan::Present(const Surface &front) {
-     Layout(back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     back.h = extent_.height;
+     back.format = swap_format_;
+-    Layout(back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    back.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    {
++        // Match acquire semaphore wait stage (TRANSFER_BIT) rather than TOP_OF_PIPE_BIT.
++        VkImageMemoryBarrier acq_bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++        acq_bar.srcAccessMask = 0;
++        acq_bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++        acq_bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++        acq_bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++        acq_bar.srcQueueFamilyIndex = acq_bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        acq_bar.image = back.image;
++        acq_bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++        vkCmdPipelineBarrier(Cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                             nullptr, 1, &acq_bar);
++    }
      VkClearColorValue black{};
      VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 -    vkCmdClearColorImage(cmd_, back.image, back.layout, &black, 1, &range);
 +    vkCmdClearColorImage(Cmd(), back.image, back.layout, &black, 1, &range);
++    {
++        // Prevent WAW race where the full-screen clear overwrites the blit on tile-based ARM Mali GPUs.
++        VkImageMemoryBarrier waw_bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
++        waw_bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++        waw_bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++        waw_bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++        waw_bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++        waw_bar.srcQueueFamilyIndex = waw_bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        waw_bar.image = back.image;
++        waw_bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++        vkCmdPipelineBarrier(Cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                             nullptr, 1, &waw_bar);
++    }
      float aspect = app::FrameAspect();
      int w = int(extent_.width), h = int(extent_.height);
      if (aspect > 0) {
-@@ -1576,23 +2516,53 @@ void Vulkan::Present(const Surface &front) {
+@@ -1576,23 +2583,69 @@ void Vulkan::Present(const Surface &front) {
      blit.srcOffsets[1] = {int(source.w) - cx, int(source.h) - cy, 1};
      blit.dstOffsets[0] = {x, y, 0};
      blit.dstOffsets[1] = {x + w, y + h, 1};
@@ -2564,16 +2645,33 @@ index fc93631..3c9d6cf 100644
      pi.pSwapchains = &swap_;
      pi.pImageIndices = &index;
      result = vkQueuePresentKHR(queue_, &pi);
+-    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR && result != VK_ERROR_OUT_OF_DATE_KHR)
 +#ifdef __ANDROID__
 +    if (result == VK_ERROR_SURFACE_LOST_KHR) {
-+        LOGW("vulkan: present surface lost, scheduling recreate");
++        static int pres_lost_logs = 0;
++        if (pres_lost_logs < 8) {
++            pres_lost_logs++;
++            LOGR("vulkan: present surface lost, scheduling recreate");
++        }
 +        surface_lost_ = true;
 +    } else
 +#endif
-     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR && result != VK_ERROR_OUT_OF_DATE_KHR)
++    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
++        static int pres_ood_logs = 0;
++        if (pres_ood_logs < 8) {
++            pres_ood_logs++;
++            LOGR("vulkan: present out of date, scheduling resize");
++        }
++        extent_ = {};
++    } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
          Check(result, "present");
 -    if (adjusted)
 -        DestroyImage(*adjusted);
++    }
++    if (frame_ == 0) {
++        LOGR("vulkan: first frame presented (acq=%d, pres=%d, swap=%ux%u, fmt=%d)", int(acq_res), int(result),
++             extent_.width, extent_.height, int(swap_format_));
++    }
      frame_++;
 -    if (frame_ % 60 == 0)
 -        LOGR("vulkan: frames=%llu draws=%llu pipelines=%zu textures=%zu", static_cast<unsigned long long>(frame_),
@@ -2610,7 +2708,7 @@ index fc93631..3c9d6cf 100644
      for (auto it = textures_.begin(); it != textures_.end();)
          if (frame_ - it->second->used > 120) {
              DestroyImage(*it->second);
-@@ -1608,32 +2578,49 @@ Vulkan::~Vulkan() {
+@@ -1608,32 +2661,49 @@ Vulkan::~Vulkan() {
          vkDestroyFramebuffer(device_, v, nullptr);
      for (auto [k, v] : pipelines_)
          vkDestroyPipeline(device_, v, nullptr);
@@ -2666,7 +2764,7 @@ index fc93631..3c9d6cf 100644
      vkDestroyDevice(device_, nullptr);
      vkDestroySurfaceKHR(instance_, surface_, nullptr);
      vkDestroyInstance(instance_, nullptr);
-@@ -1642,8 +2629,10 @@ Vulkan::~Vulkan() {
+@@ -1642,8 +2712,10 @@ Vulkan::~Vulkan() {
  std::unique_ptr<Backend> CreateBackend() {
      return std::make_unique<Vulkan>();
  }

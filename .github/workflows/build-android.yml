@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Tag versi rilis Android (contoh: v0.8.0-android.8)'
+        description: 'Tag versi rilis Android (contoh: v0.8.0-android.9)'
         required: true
-        default: 'v0.8.0-android.8'
+        default: 'v0.8.0-android.9'
         type: string
       publish_release:
         description: 'Publikasikan langsung ke GitHub Releases'
@@ -124,7 +124,7 @@ jobs:
         run: |
           VERSION="${{ inputs.release_version || github.ref_name }}"
           if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
-            VERSION="v0.8.0-android.8"
+            VERSION="v0.8.0-android.9"
           fi
           CLEAN_NAME="${VERSION#v}"
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
@@ -166,10 +166,12 @@ jobs:
           body: |
             ### Genma Onimusha — Android ARM64 Port (${{ steps.ver.outputs.tag }})
 
-            - **Fitur & Perbaikan baru pada rilis ini**:
-              - **ARM Mali / Exynos / Immortalis Vulkan Compatibility (`vulkan.cpp`)**: Menambahkan fallback otomatis format depth-stencil `VK_FORMAT_D32_SFLOAT_S8_UINT` ketika `VK_FORMAT_D24_UNORM_S8_UINT` tidak didukung GPU (umum pada MediaTek Dimensity/Helio Mali & Samsung Exynos), termasuk konversi `UploadDepth()` ke float32 dan logging format aktif ke `genma.log`.
-              - **Non-sRGB Swapchain Preference (`vulkan.cpp`)**: Memprioritaskan `VK_FORMAT_R8G8B8A8_UNORM` setelah `VK_FORMAT_B8G8R8A8_UNORM` sebelum fallback ke `formats.front()` agar layar tidak washed-out/double-gamma pada driver Android yang mengekspos `*_SRGB` di urutan pertama.
-              - **Melanjutkan optimasi `v0.8.0-android.7`**: Dedicated Async Render Thread (`render_thread.cpp`), GPU `copy_cache_`, Fast Integer `UploadDepth`, serta optimasi swizzle `texture.cpp` & index assembly `vertex.cpp`.
+            > **Catatan Pembaruan (Upgrade Note)**: Jika Anda menginstal rilis sebelumnya (`v0.8.0-android.8` atau lebih lama), **uninstall terlebih dahulu APK lama** sebelum menginstal APK ini (karena rilis CI sebelumnya menggunakan debug keystore sementara). Mulai versi ini `android:hasFragileUserData="true"` diaktifkan agar Android menawarkan opsi menyimpan data saat uninstall.
+
+            - **Perbaikan utama pada rilis ini**:
+              - **Mali-G52 / Bifrost Vulkan Sync Fix (`vulkan.cpp`)**: Menambahkan explicit `VkImageMemoryBarrier` (`TRANSFER_WRITE -> TRANSFER_WRITE`) antara `vkCmdClearColorImage` dan `vkCmdBlitImage` di `Present()` untuk mencegah WAW hazard layar hitam/berkedip pada GPU tile-based ARM Mali, menyelaraskan `srcStageMask` acquire swapchain dengan wait stage semaphore `f.acquired` (`VK_PIPELINE_STAGE_TRANSFER_BIT`), serta menjaga barrier `TRANSFER_DST_OPTIMAL` di `Layout()`.
+              - **RenderPass External Subpass Dependencies (`vulkan.cpp`)**: Menambahkan `VkSubpassDependency` (`VK_SUBPASS_EXTERNAL <-> subpass 0`) pada `Pass()` agar render pass berurutan pada Mali ter-serialisasi sesuai spesifikasi Vulkan.
+              - **Present & Surface Diagnostics (`vulkan.cpp`)**: Mengangkat log `surface lost` / `OUT_OF_DATE` / `deferred surface` ke `LOGR` agar tercatat di `genma.log` build Release, ditambah info `blit_dst` swapchain dan konfirmasi `vulkan: first frame presented`.
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`, 16 KB page-aligned
           files: |
             release-dist/*.apk

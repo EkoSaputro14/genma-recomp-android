@@ -24,6 +24,7 @@
         android:appCategory="game"
         android:extractNativeLibs="false"
         android:hardwareAccelerated="true"
+        android:hasFragileUserData="true"
         android:isGame="true"
         android:label="Genma Onimusha"
         android:requestLegacyExternalStorage="true"
