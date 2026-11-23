@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Tag versi rilis Android (contoh: v0.8.0-android.4)'
+        description: 'Tag versi rilis Android (contoh: v0.8.0-android.5)'
         required: true
-        default: 'v0.8.0-android.4'
+        default: 'v0.8.0-android.5'
         type: string
       publish_release:
         description: 'Publikasikan langsung ke GitHub Releases'
@@ -124,7 +124,7 @@ jobs:
         run: |
           VERSION="${{ inputs.release_version || github.ref_name }}"
           if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
-            VERSION="v0.8.0-android.4"
+            VERSION="v0.8.0-android.5"
           fi
           CLEAN_NAME="${VERSION#v}"
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
@@ -167,9 +167,10 @@ jobs:
             ### Genma Onimusha — Android ARM64 Port (${{ steps.ver.outputs.tag }})
 
             - **Fitur & Perbaikan baru pada rilis ini**:
-              - **Perbaikan Texture & Framebuffer Corruption**: Membatasi lookup `palette` hanya untuk format `P8` (`0x0B`) swizzled agar tekstur `DXT1/3/5` & `LIN_X8R8G8B8` tidak melewati `DecodeDxtCpu()` atau mengalami *buffer over-read* dari staging arena; membersihkan render target warna baru ke hitam pada awal pembuatan (`vkCmdClearColorImage`).
-              - **Perbaikan Slow-Motion (~6–11 FPS -> 60 FPS target)**: Mengganti full-buffer CPU hashing pada setiap `Draw()`/`Target()` dengan sampling cepat `MemSig` + `DirtyEpoch` per-frame caching; menjaga `VkRenderPass` tetap terbuka antar-draw (`BeginRender`/`EndRender`) dan menghapus redundant `VK_PIPELINE_STAGE_ALL_COMMANDS_BIT` barriers untuk GPU TBDR Adreno; menambahkan 2-frame double buffering (`kFrames = 2`) dan shader LUT GPU untuk gamma non-identitas (tanpa CPU `Read()` stall).
-              - Menambahkan pencatatan `fps` dan `ms/frame` ke log setiap 60 frame untuk verifikasi performa.
+              - **Eliminasi Stall Sinkron (`Drain()`) pada Occlusion Queries & Fences**: Mengubah `Vulkan::GetReport()` dan `Vulkan::Fence()` / `WaitFence()` menjadi asinkron berbasis slot `FrameSlot` (setara pola `D3D12Backend::DeliverReports()`), sehingga visibility queries dan fence insertion tidak lagi memicu `vkWaitForFences` di tengah frame.
+              - **Front-End Shader & Pipeline Key Caching**: Menambahkan `vs_cache_` (`VsCacheKey`) dan `ps_cache_` (`PixelKey`) sebelum generator string HLSL + 29 pass `std::string::replace()`, mengganti `PipelineKey` dari `std::vector<uint64_t>` ke fixed POD array dalam `unordered_map`, serta memindahkan `Assembled asm_` & scratch upload buffers menjadi member reusable (menghilangkan ratusan heap allocation per frame).
+              - **Feedback Snapshot Pooling & Swapchain Triple Buffering**: Pooling gambar feedback `t == rt || t == ds` per `FrameSlot` tanpa `vkAllocateMemory`/`vkFreeMemory` berulang, mendukung `vkCmdClearAttachments` in-pass, serta meminta `minImageCount >= 3` untuk swapchain agar mengurangi penalti vsync FIFO.
+              - **Telemetry Breakdown**: Menambahkan rincian waktu CPU per tahap (`asm`, `tex`, `shd`, `rec`, `clr`, `cpy`, `syn`, `pres`, `wait`, `other`) serta penghitung stall (`dr`, `rpt`, `fnc`, `rpb`, `snp`, `tup`, `rtup`) setiap 60 frame di `genma.log`.
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`, 16 KB page-aligned
           files: |
             release-dist/*.apk
