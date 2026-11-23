@@ -26,6 +26,7 @@
 #include "host.h"
 #include "image_symbols.h"
 #include "kernel/kernel.h"
+#include "lang_id.h"
 
 namespace {
 
@@ -42,12 +43,18 @@ std::mutex g_loose_lock;
 input::Pad g_loose_pad{};
 input::Pad g_touch_pad{};
 
-// Android graphics / upscale state bridged with Vulkan & Settings UI (defaults preserve v0.8.0-android.9 behavior).
+// Android graphics / upscale & localization state bridged with Vulkan, VFS, & Settings UI
+// (defaults preserve v0.8.0-android.9/10 behavior).
 std::atomic<float> g_render_scale{1.0f};
 std::atomic<bool> g_nearest_present{false};
 std::atomic<float> g_max_aniso{1.0f};
 std::atomic<uint32_t> g_max_image_dim{4096};
 std::atomic<bool> g_settings_loaded{false};
+std::atomic<bool> g_fill_no_stretch{false};
+std::atomic<float> g_wide_vertical_pan{0.70f};
+std::atomic<bool> g_indonesian_game{false};
+std::mutex g_game_dir_lock;
+std::string g_game_dir;
 
 std::string Utf8(const wchar_t* w) {
     std::string s;
@@ -255,6 +262,16 @@ Java_com_genmarecomp_android_GenmaActivity_nativeSetRenderOptions(
     host::SetNearestPresent(nearestPresent == JNI_TRUE);
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_genmarecomp_android_GenmaActivity_nativeSetExtendedOptions(
+    JNIEnv*, jclass, jboolean fillNoStretch, jfloat widePan, jboolean indonesianGame) {
+    host::SetFillNoStretch(fillNoStretch == JNI_TRUE);
+    host::SetWideVerticalPan(widePan);
+    const bool id = (indonesianGame == JNI_TRUE);
+    host::SetIndonesianGame(id);
+    lang_id::ApplyXbeLanguage(id);
+}
+
 extern "C" JNIEXPORT jintArray JNICALL
 Java_com_genmarecomp_android_GenmaActivity_nativeGetGraphicsSettings(JNIEnv* env, jclass) {
     std::lock_guard lock(app::UiLock());
@@ -265,7 +282,7 @@ Java_com_genmarecomp_android_GenmaActivity_nativeGetGraphicsSettings(JNIEnv* env
     const bool modern = (!app::kGame.options.empty() && app::kGame.options[0].flag)
                             ? *app::kGame.options[0].flag
                             : true;
-    jint vals[11] = {
+    jint vals[14] = {
         jint(std::lround(host::RenderScale() * 100.0f)),
         jint(aspect),
         jint(s.aniso),
@@ -277,9 +294,12 @@ Java_com_genmarecomp_android_GenmaActivity_nativeGetGraphicsSettings(JNIEnv* env
         jint(host::NearestPresent() ? 1 : 0),
         jint(modern ? 1 : 0),
         jint(std::max(1, int(std::floor(host::MaxAniso())))),
+        jint(host::FillNoStretch() ? 1 : 0),
+        jint(std::lround(host::WideVerticalPan() * 100.0f)),
+        jint(host::IndonesianGame() ? 1 : 0),
     };
-    jintArray out = env->NewIntArray(11);
-    if (out) env->SetIntArrayRegion(out, 0, 11, vals);
+    jintArray out = env->NewIntArray(14);
+    if (out) env->SetIntArrayRegion(out, 0, 14, vals);
     return out;
 }
 
@@ -287,9 +307,14 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_genmarecomp_android_GenmaActivity_nativeApplyGraphicsSettings(
     JNIEnv*, jclass, jint scalePct, jint aspect, jint aniso, jboolean vsync, jint fpsCap,
     jint overscanX100, jboolean pointNudge, jboolean preciseDepth, jboolean nearestPresent,
-    jboolean modernControls) {
+    jboolean modernControls, jboolean fillNoStretch, jint widePanPct, jboolean indonesianGame) {
     host::SetRenderScale(std::clamp(float(scalePct) / 100.0f, 0.5f, 3.0f));
     host::SetNearestPresent(nearestPresent == JNI_TRUE);
+    host::SetFillNoStretch(fillNoStretch == JNI_TRUE);
+    host::SetWideVerticalPan(float(std::clamp(int(widePanPct), 0, 100)) / 100.0f);
+    const bool id = (indonesianGame == JNI_TRUE);
+    host::SetIndonesianGame(id);
+    lang_id::ApplyXbeLanguage(id);
     {
         std::lock_guard lock(app::UiLock());
         app::Settings& s = app::Get();
@@ -306,10 +331,12 @@ Java_com_genmarecomp_android_GenmaActivity_nativeApplyGraphicsSettings(
         if (g_settings_loaded.load()) {
             app::Save();
         }
-        LOGR("settings: scale=%.2fx aspect=%d aniso=%u vsync=%d fps=%u overscan=%.2f%% nudge=%d pdepth=%d nearest=%d modern=%d",
-             host::RenderScale(), int(s.aspect), s.aniso, int(s.vsync), s.fps_cap, s.overscan,
-             int(s.point_nudge), int(s.precise_depth), int(host::NearestPresent()),
-             (!app::kGame.options.empty() && app::kGame.options[0].flag) ? int(*app::kGame.options[0].flag) : 1);
+        LOGR("settings: scale=%.2fx aspect=%d fillNoStretch=%d pan=%.2f aniso=%u vsync=%d fps=%u overscan=%.2f%% nudge=%d pdepth=%d nearest=%d modern=%d lang_id=%d",
+             host::RenderScale(), int(s.aspect), int(host::FillNoStretch()), host::WideVerticalPan(),
+             s.aniso, int(s.vsync), s.fps_cap, s.overscan, int(s.point_nudge), int(s.precise_depth),
+             int(host::NearestPresent()),
+             (!app::kGame.options.empty() && app::kGame.options[0].flag) ? int(*app::kGame.options[0].flag) : 1,
+             int(host::IndonesianGame()));
     }
 }
 
@@ -339,6 +366,21 @@ void SetGpuCaps(float max_aniso, uint32_t max_image_dim) {
 }
 float MaxAniso() { return g_max_aniso.load(); }
 uint32_t MaxImageDim() { return g_max_image_dim.load(); }
+bool FillNoStretch() { return g_fill_no_stretch.load(); }
+void SetFillNoStretch(bool fill) { g_fill_no_stretch.store(fill); }
+float WideVerticalPan() { return g_wide_vertical_pan.load(); }
+void SetWideVerticalPan(float pan) { g_wide_vertical_pan.store(std::clamp(pan, 0.0f, 1.0f)); }
+bool IndonesianGame() { return g_indonesian_game.load(); }
+void SetIndonesianGame(bool enabled) { g_indonesian_game.store(enabled); }
+void OnXbeLoaded() { lang_id::OnXbeLoaded(); }
+std::string GameDir() {
+    std::lock_guard<std::mutex> lock(g_game_dir_lock);
+    return g_game_dir;
+}
+void SetGameDir(const std::string& dir) {
+    std::lock_guard<std::mutex> lock(g_game_dir_lock);
+    g_game_dir = dir;
+}
 
 }  // namespace host
 
@@ -435,6 +477,8 @@ int main(int, char**) {
         logx::Flush();
         return 1;
     }
+    host::SetGameDir(game.dir.string());
+    lang_id::LoadCustomOverrides(game.dir);
 
     input::Init();
     if (app::kGame.window) app::kGame.window(g_window);

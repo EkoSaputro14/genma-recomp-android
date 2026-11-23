@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Tag versi rilis Android (contoh: v0.8.0-android.10)'
+        description: 'Tag versi rilis Android (contoh: v0.8.0-android.11)'
         required: true
-        default: 'v0.8.0-android.10'
+        default: 'v0.8.0-android.11'
         type: string
       publish_release:
         description: 'Publikasikan langsung ke GitHub Releases'
@@ -124,7 +124,7 @@ jobs:
         run: |
           VERSION="${{ inputs.release_version || github.ref_name }}"
           if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
-            VERSION="v0.8.0-android.10"
+            VERSION="v0.8.0-android.11"
           fi
           CLEAN_NAME="${VERSION#v}"
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
@@ -169,12 +169,14 @@ jobs:
             > **Catatan Pembaruan**: Semua pengaturan grafis dan tata letak kontroler default pada versi ini identik 100% dengan `v0.8.0-android.9` (`1x` Native 480p, `4:3`, V-Sync On, 60 FPS, Bilinear) agar kompatibilitas dan performa baseline tetap terjaga. Jika Anda masih memakai build debug keystore yang berbeda sebelumnya, uninstall APK lama terlebih dahulu (`hasFragileUserData="true"` sudah aktif sejak `.9`).
 
             - **Fitur Baru pada Rilis Ini**:
-              - **Customisasi Kontroler Layar Touch Screen (`CFG` -> Edit Touch Layout / Preferences)**:
-                - Mode edit interaktif langsung di atas layar: geser posisi setiap tombol (`L`, `DPAD`, `A/B/X/Y`, `LB/LT/RT/RB`, `BACK/START`, `PAD`, `CFG`), ubah ukuran per tombol (`60%–180%`), sembunyikan/tampilkan tombol individu, pindah posisi toolbar (`Top/Bot`), serta tombol **Reset / Cancel / Save**.
-                - Pengaturan global overlay: **Opacity (`20%–100%`)**, **Global Button Scale (`70%–150%`)**, dan toggle visibilitas yang tersimpan otomatis (`SharedPreferences`).
-              - **Pengaturan Grafis & Upscaling Recomp (`CFG` -> Graphics & Upscale Settings)**:
-                - **Internal Resolution Upscale**: `0.75x (360p Performance)`, `1x (480p Native — Default)`, `1.5x (720p HD)`, `2x (960p FHD)`, `2.5x (1200p)`, `3x (1440p QHD)` lengkap dengan scaling depth/stencil, viewport/scissor, occlusion query, `spreadtap`, `rtshift`, dan readback `Sync()` yang aman.
-                - **Opsi Grafis Recomp Standar**: **Display Scaling Filter** (`Bilinear` default / `Nearest`), **Anisotropic Filtering** (`Off` default hingga batas GPU `2x–16x`), **Aspect Ratio** (`4:3` default, `16:9`, `Auto`, `Stretch`), **Overscan Crop** (`3.3%` default, `0%`, `5.0%`), **FPS Cap** (`60` default, `30`, `120`, `Unlimited`), **V-Sync**, **Precise Depth Fix**, **Stable Point Sampling**, dan **Modern Analog Controls**, tersimpan ke `settings.toml` & `SharedPreferences`.
+              - **Resolusi 16:9 & Layar Penuh Tanpa Gepeng (`CFG` -> Graphics -> Aspect Ratio)**:
+                - Mode **`16:9 (Tanpa Gepeng / No Stretch)`** dan **`Full Screen (Tanpa Gepeng)`** menjaga rasio piksel `1:1` secara presisi dengan *vertical crop* pada presentasi Vulkan (`Present()`) tanpa menarik gambar ke samping, sangat tajam saat dipadukan dengan Upscale `1.5x–3x`.
+                - Pengaturan **Posisi Vertikal 16:9 (`25% Top HUD-Safe`, `50% Center / FMV 16:9`, `70% Subtitle-Safe Default`, `90% Bottom`)** menjaga subtitle maupun HUD tetap terbaca nyaman.
+                - Mode **`4:3 (Default)`** dan seluruh pengaturan bawaan `v0.8.0-android.10` (`1x`, `60 FPS`, V-Sync On, Bilinear) tetap dipertahankan.
+              - **Translasi Bahasa Indonesia Lengkap (`CFG` -> Language / Bahasa)**:
+                - Lokalisasi penuh seluruh menu & dialog aplikasi Android (`English` bawaan / `Bahasa Indonesia`).
+                - Translasi teks & subtitle in-game secara *runtime* (tanpa memodifikasi ISO!): mencakup seluruh **685 subtitle cutscene & dialog ruangan unik** di 119 ruangan (`.rdt`/`.ldt`), **162 nama item/senjata/peta/opsi**, **69 deskripsi item**, **24 pesan sistem/pintu**, serta **28 pilihan menu** (`YA / TIDAK / SIMPAN / KUATKAN / KELUAR`).
+                - Mendukung *layered VFS override* melalui folder `lang/id/` (`custom_id.tsv` atau file lepas) maupun `mods/` di folder `GenmaOnimusha/`.
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`, 16 KB page-aligned
           files: |
             release-dist/*.apk

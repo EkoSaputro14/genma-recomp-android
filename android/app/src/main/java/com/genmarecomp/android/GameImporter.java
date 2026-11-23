@@ -3,6 +3,7 @@ package com.genmarecomp.android;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
+import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
@@ -42,6 +43,15 @@ final class GameImporter {
         this.activity = activity;
     }
 
+    private boolean isId() {
+        return "id".equals(activity.getSharedPreferences(GenmaActivity.PREFS_GRAPHICS, Context.MODE_PRIVATE)
+                .getString(GenmaActivity.KEY_UI_LANG, "en"));
+    }
+
+    private String tr(String en, String id) {
+        return isId() ? id : en;
+    }
+
     boolean pick() {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
@@ -50,7 +60,9 @@ final class GameImporter {
             activity.startActivityForResult(i, REQUEST);
             return true;
         } catch (ActivityNotFoundException e) {
-            message("Import game", "This device has no file picker to select the disc image.", null);
+            message(tr("Import game", "Impor game"),
+                    tr("This device has no file picker to select the disc image.",
+                       "Perangkat ini tidak memiliki pemilih berkas untuk memilih ISO."), null);
             return false;
         }
     }
@@ -60,13 +72,18 @@ final class GameImporter {
         long size = size(uri);
         String lower = name != null ? name.toLowerCase() : "";
         if (name == null || (!lower.endsWith(".iso") && !lower.endsWith(".xiso"))) {
-            message("Import game", "Choose the game's Xbox disc image (.iso or .xiso).", () -> done.accept(false));
+            message(tr("Import game", "Impor game"),
+                    tr("Choose the game's Xbox disc image (.iso or .xiso).",
+                       "Pilih berkas citra cakram Xbox game (.iso atau .xiso)."), () -> done.accept(false));
             return;
         }
         dir.mkdirs();
         if (size > 0 && dir.getUsableSpace() < size + (64L << 20)) {
-            message("Not enough space", String.format("The disc image needs %.1f GB free, only %.1f GB available.",
-                    size / 1e9, dir.getUsableSpace() / 1e9), () -> done.accept(false));
+            message(tr("Not enough space", "Ruang penyimpanan tidak cukup"),
+                    String.format(tr("The disc image needs %.1f GB free, only %.1f GB available.",
+                                     "Berkas ISO membutuhkan %.1f GB kosong, hanya tersedia %.1f GB."),
+                            size / 1e9, dir.getUsableSpace() / 1e9),
+                    () -> done.accept(false));
             return;
         }
 
@@ -74,7 +91,7 @@ final class GameImporter {
         bar.setMax(1000);
         bar.setIndeterminate(size <= 0);
         TextView text = new TextView(activity);
-        text.setText("Starting…");
+        text.setText(tr("Starting…", "Memulai…"));
         LinearLayout box = new LinearLayout(activity);
         box.setOrientation(LinearLayout.VERTICAL);
         int pad = Math.round(20 * activity.getResources().getDisplayMetrics().density);
@@ -83,10 +100,10 @@ final class GameImporter {
         box.addView(text);
         cancelled = false;
         AlertDialog progress = new AlertDialog.Builder(activity)
-                .setTitle("Importing " + name)
+                .setTitle(tr("Importing ", "Mengimpor ") + name)
                 .setView(box)
                 .setCancelable(false)
-                .setNegativeButton("Cancel", (d, w) -> cancelled = true)
+                .setNegativeButton(tr("Cancel", "Batal"), (d, w) -> cancelled = true)
                 .show();
         if (progress.getWindow() != null) {
             progress.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -100,7 +117,7 @@ final class GameImporter {
                  FileInputStream in = new FileInputStream(pfd.getFileDescriptor());
                  FileChannel src = in.getChannel()) {
                 if (isXboxImage(src) == Boolean.FALSE) {
-                    error = name + " is not a valid original Xbox disc image.";
+                    error = name + tr(" is not a valid original Xbox disc image.", " bukan berkas ISO Xbox asli yang valid.");
                 } else {
                     try (FileOutputStream out = new FileOutputStream(part); FileChannel dst = out.getChannel()) {
                         ByteBuffer buf = ByteBuffer.allocateDirect(BUFFER);
@@ -116,26 +133,32 @@ final class GameImporter {
                             }
                         }
                         out.getFD().sync();
-                        if (!cancelled && size > 0 && copied != size) error = "The copy stopped early.";
+                        if (!cancelled && size > 0 && copied != size) {
+                            error = tr("The copy stopped early.", "Penyalinan berhenti sebelum selesai.");
+                        }
                     }
                 }
             } catch (Exception e) {
                 Log.w(TAG, "import failed", e);
-                error = "The copy failed: " + e.getMessage();
+                error = tr("The copy failed: ", "Gagal menyalin: ") + e.getMessage();
             }
             boolean ok = error == null && !cancelled && part.renameTo(iso);
             if (!ok) {
                 part.delete();
-                if (error == null && !cancelled) error = "The image could not be finalized.";
+                if (error == null && !cancelled) {
+                    error = tr("The image could not be finalized.", "Berkas ISO gagal diselesaikan.");
+                }
             }
             String why = error;
             main.post(() -> {
                 progress.dismiss();
                 if (ok) {
                     Log.i(TAG, "imported " + iso);
-                    message("Game imported", name + " is ready. Genma Onimusha will start in a moment.", () -> done.accept(true));
+                    message(tr("Game imported", "Game berhasil diimpor"),
+                            name + tr(" is ready. Genma Onimusha will start in a moment.",
+                                      " siap. Genma Onimusha akan segera dimulai."), () -> done.accept(true));
                 } else if (why != null) {
-                    message("Import failed", why, () -> done.accept(false));
+                    message(tr("Import failed", "Impor gagal"), why, () -> done.accept(false));
                 } else {
                     done.accept(false);
                 }
