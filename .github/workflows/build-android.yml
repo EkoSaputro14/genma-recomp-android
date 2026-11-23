@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Tag versi rilis Android (contoh: v0.8.0-android.11)'
+        description: 'Tag versi rilis Android (contoh: v0.8.0-android.12)'
         required: true
-        default: 'v0.8.0-android.11'
+        default: 'v0.8.0-android.12'
         type: string
       publish_release:
         description: 'Publikasikan langsung ke GitHub Releases'
@@ -124,7 +124,7 @@ jobs:
         run: |
           VERSION="${{ inputs.release_version || github.ref_name }}"
           if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
-            VERSION="v0.8.0-android.11"
+            VERSION="v0.8.0-android.12"
           fi
           CLEAN_NAME="${VERSION#v}"
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
@@ -166,17 +166,16 @@ jobs:
           body: |
             ### Genma Onimusha — Android ARM64 Port (${{ steps.ver.outputs.tag }})
 
-            > **Catatan Pembaruan**: Semua pengaturan grafis dan tata letak kontroler default pada versi ini identik 100% dengan `v0.8.0-android.9` (`1x` Native 480p, `4:3`, V-Sync On, 60 FPS, Bilinear) agar kompatibilitas dan performa baseline tetap terjaga. Jika Anda masih memakai build debug keystore yang berbeda sebelumnya, uninstall APK lama terlebih dahulu (`hasFragileUserData="true"` sudah aktif sejak `.9`).
+            > **Catatan Pembaruan**: Rilis ini memperbaiki bug *softlock/stuck* pada mode **Bahasa Indonesia** (`v0.8.0-android.11`). Dapat langsung di-install menimpa `v0.8.0-android.9 / .10 / .11` tanpa perlu uninstall APK lama (`hasFragileUserData="true"` dan keystore rilis konsisten). Pengaturan grafis default tetap sama (`1x` Native 480p, `4:3`, V-Sync On, 60 FPS, Bilinear).
 
-            - **Fitur Baru pada Rilis Ini**:
-              - **Resolusi 16:9 & Layar Penuh Tanpa Gepeng (`CFG` -> Graphics -> Aspect Ratio)**:
-                - Mode **`16:9 (Tanpa Gepeng / No Stretch)`** dan **`Full Screen (Tanpa Gepeng)`** menjaga rasio piksel `1:1` secara presisi dengan *vertical crop* pada presentasi Vulkan (`Present()`) tanpa menarik gambar ke samping, sangat tajam saat dipadukan dengan Upscale `1.5x–3x`.
-                - Pengaturan **Posisi Vertikal 16:9 (`25% Top HUD-Safe`, `50% Center / FMV 16:9`, `70% Subtitle-Safe Default`, `90% Bottom`)** menjaga subtitle maupun HUD tetap terbaca nyaman.
-                - Mode **`4:3 (Default)`** dan seluruh pengaturan bawaan `v0.8.0-android.10` (`1x`, `60 FPS`, V-Sync On, Bilinear) tetap dipertahankan.
-              - **Translasi Bahasa Indonesia Lengkap (`CFG` -> Language / Bahasa)**:
-                - Lokalisasi penuh seluruh menu & dialog aplikasi Android (`English` bawaan / `Bahasa Indonesia`).
-                - Translasi teks & subtitle in-game secara *runtime* (tanpa memodifikasi ISO!): mencakup seluruh **685 subtitle cutscene & dialog ruangan unik** di 119 ruangan (`.rdt`/`.ldt`), **162 nama item/senjata/peta/opsi**, **69 deskripsi item**, **24 pesan sistem/pintu**, serta **28 pilihan menu** (`YA / TIDAK / SIMPAN / KUATKAN / KELUAR`).
-                - Mendukung *layered VFS override* melalui folder `lang/id/` (`custom_id.tsv` atau file lepas) maupun `mods/` di folder `GenmaOnimusha/`.
+            - **Perbaikan Kritis pada Rilis Ini (`v0.8.0-android.12`)**:
+              - **Perbaikan Softlock / Stuck Cutscene & Dialog Bahasa Indonesia (`native/lang_id.cpp`)**:
+                - Mempertahankan penuh **2-byte opcode `0xF0 <arg>`** (mode tunggu tombol `0x00` vs timer cutscene otomatis `0x0C–0xF0`) pada seluruh 119 file `.rdt`, 3 `.ldt`, tabel XBE (`sys_msgs`, `item_descs`, `choices`), serta *custom overrides* (`custom_id.tsv`) dan pesan yang tidak diterjemahkan.
+                - Sebelumnya pemotongan byte `<arg>` menyebabkan VM teks membaca byte pertama pesan berikutnya (`0xF4` / `0xFA`) sebagai timer `8.13` detik non-skippable hingga memicu *softlock* (mis. di `ROOM007.RDT`).
+                - Deduplikasi RDT/LDT kini membedakan payload berdasarkan `<arg>` asli agar pesan jeda dengan durasi berbeda tidak ikut bergabung.
+            - **Fitur Utama yang Tersedia (`v0.8.0-android.11+`)**:
+              - **Resolusi 16:9 & Layar Penuh Tanpa Gepeng (`CFG` -> Graphics -> Aspect Ratio)**: mode `16:9 (Tanpa Gepeng)` & `Full Screen (Tanpa Gepeng)` dengan piksel `1:1` presisi, `Posisi Vertikal 16:9`, serta Upscale `0.75x–3x`.
+              - **Translasi Bahasa Indonesia Lengkap (`CFG` -> Language / Bahasa)**: lokalisasi menu aplikasi Android & seluruh teks/subtitle in-game secara *runtime* (tanpa memodifikasi ISO) + dukungan `lang/id/` (`custom_id.tsv`).
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`, 16 KB page-aligned
           files: |
             release-dist/*.apk
