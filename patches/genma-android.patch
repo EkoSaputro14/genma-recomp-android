@@ -488,7 +488,7 @@ index 3ebd900..70eb733 100644
          out.elements[size_t(inputs.regs[k])] = {DXGI_FORMAT_R32G32B32A32_FLOAT, 0, uint16_t(k * 16)};
      }
 diff --git a/sdk/runtime/gpu/vulkan.cpp b/sdk/runtime/gpu/vulkan.cpp
-index fc93631..261a250 100644
+index fc93631..61c5c23 100644
 --- a/sdk/runtime/gpu/vulkan.cpp
 +++ b/sdk/runtime/gpu/vulkan.cpp
 @@ -5,6 +5,7 @@
@@ -1704,18 +1704,18 @@ index fc93631..261a250 100644
 +    bool same = p && SameTextureDesc(p->desc, d);
 +    uint64_t ep = DirtyEpoch(d.data);
 +    if (same && p->checked_frame == frame_ + 1 && p->palette_hash == pal_hash && ep == p->epoch) {
-         p->used = frame_;
-         return p.get();
-     }
--    p = MakeImage(d.width, d.height, d.depth, d.levels, d.cube ? 6 : 1, FormatOf(Format(d.format).host), false, false);
++        p->used = frame_;
++        return p.get();
++    }
 +    uint64_t sig = MemSig(d.data, TotalSize(d)) ^ ep ^ pal_hash;
 +    if (same && sig == p->signature) {
 +        p->checked_frame = frame_ + 1;
 +        p->palette_hash = pal_hash;
 +        p->epoch = ep;
-+        p->used = frame_;
-+        return p.get();
-+    }
+         p->used = frame_;
+         return p.get();
+     }
+-    p = MakeImage(d.width, d.height, d.depth, d.levels, d.cube ? 6 : 1, FormatOf(Format(d.format).host), false, false);
 +    if (p) {
 +        if (frame_ - p->used < kFrames)
 +            CurrentSlot().retire.push_back(std::move(p));
@@ -2045,7 +2045,7 @@ index fc93631..261a250 100644
 +            fk.light = vkey.light;
 +            fk.types = vkey.types;
 +            for (int i = 0; i < 4; i++)
-+                fk.tex[i] = vkey.tex[i];
++                fk.tex[i] = vkey.tex[size_t(i)];
 +        }
 +        VkShaderModule mod = Shader(
 +            program ? VertexProgramHlsl(s.vs->program, a.regs) : FixedVertexHlsl(a.regs, a.pretransformed, 0, fk),
@@ -2663,7 +2663,7 @@ index fc93631..261a250 100644
 +    float g = tex1.Sample(smp1, float2((c.g * 255.0 + 0.5) / 256.0, 0.5)).g;
 +    float b = tex1.Sample(smp1, float2((c.b * 255.0 + 0.5) / 256.0, 0.5)).b;
 +    return float4(r, g, b, 1.0);
- }
++}
 +)";
 +        uint64_t hvs = 0, hps = 0;
 +        gamma_vs_ = Shader(kGammaVs, true, hvs);
@@ -2747,7 +2747,7 @@ index fc93631..261a250 100644
 +    surface_lost_ = false;
 +    LOGR("vulkan: surface recreated (epoch=%u)", surface_epoch_);
 +    return true;
-+}
+ }
 +#endif
  void Vulkan::Resize() {
      auto size = app::LinuxWindowSize();
@@ -3043,17 +3043,39 @@ index fc93631..261a250 100644
      float aspect = app::FrameAspect();
      int w = int(extent_.width), h = int(extent_.height);
      if (aspect > 0) {
-@@ -1569,36 +2816,115 @@ void Vulkan::Present(const Surface &front) {
+@@ -1569,36 +2816,135 @@ void Vulkan::Present(const Surface &front) {
      }
      int x = (int(extent_.width) - w) / 2, y = (int(extent_.height) - h) / 2;
      float crop = app::Get().overscan * 0.01f;
 -    int cx = int(std::lround(source.w * crop)), cy = int(std::lround(source.h * crop));
 +    int cx = std::clamp(int(std::lround(source.w * crop)), 0, int(source.w) / 4);
 +    int cy = std::clamp(int(std::lround(source.h * crop)), 0, int(source.h) / 4);
++    int sx0 = cx, sx1 = int(source.w) - cx;
++    int sy0 = cy, sy1 = int(source.h) - cy;
++#ifdef __ANDROID__
++    // 16:9 / Full-Screen No-Stretch ("Tanpa Gepeng"): keep 1:1 square pixels by vertically
++    // cropping the 4:3 internal source instead of stretching it horizontally.
++    const bool no_stretch_wide = (aspect > 0.0f && app::Widescreen()) || (aspect == 0.0f && host::FillNoStretch());
++    if (no_stretch_wide && w > 0 && h > 0) {
++        const int sw = sx1 - sx0;
++        const int sh = sy1 - sy0;
++        const float dst_aspect = float(w) / float(h);
++        const float src_aspect = (sh > 0) ? float(sw) / float(sh) : (4.0f / 3.0f);
++        if (dst_aspect > src_aspect + 0.01f) {
++            const int vis_h = std::clamp(int(std::lround(float(sw) / dst_aspect)), 1, sh);
++            const int slack = sh - vis_h;
++            const float pan = std::clamp(host::WideVerticalPan(), 0.0f, 1.0f);
++            sy0 += int(std::lround(float(slack) * pan));
++            sy1 = sy0 + vis_h;
++        }
++    }
++#endif
      VkImageBlit blit{};
      blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-     blit.srcOffsets[0] = {cx, cy, 0};
-     blit.srcOffsets[1] = {int(source.w) - cx, int(source.h) - cy, 1};
+-    blit.srcOffsets[0] = {cx, cy, 0};
+-    blit.srcOffsets[1] = {int(source.w) - cx, int(source.h) - cy, 1};
++    blit.srcOffsets[0] = {sx0, sy0, 0};
++    blit.srcOffsets[1] = {sx1, sy1, 1};
      blit.dstOffsets[0] = {x, y, 0};
      blit.dstOffsets[1] = {x + w, y + h, 1};
 -    vkCmdBlitImage(cmd_, source.image, source.layout, back.image, back.layout, 1, &blit, VK_FILTER_LINEAR);
@@ -3169,7 +3191,7 @@ index fc93631..261a250 100644
  }
  Vulkan::~Vulkan() {
      if (!device_)
-@@ -1608,32 +2934,49 @@ Vulkan::~Vulkan() {
+@@ -1608,32 +2954,49 @@ Vulkan::~Vulkan() {
          vkDestroyFramebuffer(device_, v, nullptr);
      for (auto [k, v] : pipelines_)
          vkDestroyPipeline(device_, v, nullptr);
@@ -3225,7 +3247,7 @@ index fc93631..261a250 100644
      vkDestroyDevice(device_, nullptr);
      vkDestroySurfaceKHR(instance_, surface_, nullptr);
      vkDestroyInstance(instance_, nullptr);
-@@ -1642,8 +2985,10 @@ Vulkan::~Vulkan() {
+@@ -1642,8 +3005,10 @@ Vulkan::~Vulkan() {
  std::unique_ptr<Backend> CreateBackend() {
      return std::make_unique<Vulkan>();
  }
@@ -3237,6 +3259,187 @@ index fc93631..261a250 100644
  }
 +#endif
  } // namespace gpu
+diff --git a/sdk/runtime/kernel/boot.cpp b/sdk/runtime/kernel/boot.cpp
+index aa0d5da..b8ece41 100644
+--- a/sdk/runtime/kernel/boot.cpp
++++ b/sdk/runtime/kernel/boot.cpp
+@@ -5,6 +5,9 @@
+ 
+ #include "app/app.h"
+ #include "kernel/kernel.h"
++#ifdef __ANDROID__
++#include "host.h"
++#endif
+ 
+ #ifdef _WIN32
+ #ifndef NOMINMAX
+@@ -113,6 +116,9 @@ bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::stri
+         W32(sec_hdr + uint32_t(i) * 56 + 0x18, 1);
+     }
+     if (app::kGame.loaded) app::kGame.loaded();
++#ifdef __ANDROID__
++    host::OnXbeLoaded();
++#endif
+ 
+     InitKernelData();
+     dispatch::Init();
+diff --git a/sdk/runtime/kernel/files.cpp b/sdk/runtime/kernel/files.cpp
+index b488f75..b26de3f 100644
+--- a/sdk/runtime/kernel/files.cpp
++++ b/sdk/runtime/kernel/files.cpp
+@@ -11,6 +11,10 @@
+ #include "kernel/exports.h"
+ #include "core/file_observer.h"
+ #include "core/streaming.h"
++#ifdef __ANDROID__
++#include "host.h"
++#include "lang_id.h"
++#endif
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -80,6 +84,9 @@ struct File : Object {
+     size_t next = 0;
+     bool listed = false;
+     bool delete_on_close = false;
++#ifdef __ANDROID__
++    std::vector<lang_id::BytePatch> patches;
++#endif
+     std::mutex io;  // threads sharing a handle: seek and transfer stay together
+     File() : Object(ObjType::File) {}
+     ~File() override {
+@@ -273,11 +280,52 @@ Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
+     // no Xbox name holds ':', and fs::path would take "D:" as a host drive
+     for (auto& part : parts)
+         if (part.find(':') != std::string::npos) return {};
+-    if (best->first == kCdRom)
++    if (best->first == kCdRom) {
++#ifdef __ANDROID__
++        if (!parts.empty()) {
++            std::error_code ec;
++            if (host::IndonesianGame()) {
++                fs::path id_root = best->second / "lang" / "id";
++                if (fs::is_directory(id_root, ec)) {
++                    fs::path id_override = MatchCase(id_root, parts);
++                    if (fs::is_regular_file(id_override, ec)) return {id_override.string()};
++                }
++            }
++            fs::path mod_root = best->second / "mods";
++            if (fs::is_directory(mod_root, ec)) {
++                fs::path mod_override = MatchCase(mod_root, parts);
++                if (fs::is_regular_file(mod_override, ec)) return {mod_override.string()};
++            }
++        }
++#endif
+         if (const Disc* disc = MountedDisc()) return {{}, true, disc->Find(parts)};
++    }
+     return {MatchCase(best->second, parts).string()};
+ }
+ 
++#ifdef __ANDROID__
++void AttachLanguagePatches(File& f) {
++    if (f.dir || !host::IndonesianGame()) return;
++    if (f.entry) {
++        const Disc* disc = MountedDisc();
++        if (!disc) return;
++        f.patches = lang_id::BuildFilePatches(f.xbox, f.entry->size, [&](uint64_t off, void* dst, size_t len) -> size_t {
++            return disc->Read(*f.entry, off, dst, uint32_t(len));
++        });
++    } else if (f.fp) {
++        std::error_code ec;
++        uint64_t sz = fs::file_size(f.host, ec);
++        if (!ec && sz > 0) {
++            f.patches = lang_id::BuildFilePatches(f.xbox, sz, [&](uint64_t off, void* dst, size_t len) -> size_t {
++                Seek(f.fp, off);
++                return std::fread(dst, 1, len, f.fp);
++            });
++            Seek(f.fp, 0);
++        }
++    }
++}
++#endif
++
+ // the disc image is read only: nothing on it is created, replaced or written
+ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t handle_out, uint32_t iosb, uint32_t disposition,
+                     uint32_t options) {
+@@ -298,6 +346,9 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
+     f->xbox = Normalize(name);
+     f->entry = e;
+     f->dir = e->dir;
++#ifdef __ANDROID__
++    AttachLanguagePatches(*f);
++#endif
+     W32(handle_out, NewHandle(f));
+     IoStatus(iosb, kSuccess, 1);
+     LOG_FIRST(400, "open %s", name.c_str());
+@@ -313,11 +364,34 @@ bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) {
+     if (t.disc) {
+         if (!t.entry || t.entry->dir) return false;
+         out.resize(t.entry->size);
+-        return MountedDisc()->Read(*t.entry, 0, out.data(), t.entry->size) == t.entry->size;
++        if (MountedDisc()->Read(*t.entry, 0, out.data(), t.entry->size) != t.entry->size) return false;
++#ifdef __ANDROID__
++        if (host::IndonesianGame()) {
++            auto patches = lang_id::BuildFilePatches(xbox_path, out.size(), [&](uint64_t off, void* dst, size_t len) -> size_t {
++                if (off >= out.size()) return 0;
++                size_t n = std::min(len, out.size() - size_t(off));
++                std::memcpy(dst, out.data() + off, n);
++                return n;
++            });
++            lang_id::ApplyBytePatches(patches, 0, out.data(), out.size());
++        }
++#endif
++        return true;
+     }
+     std::ifstream f(t.host, std::ios::binary);
+     if (!f) return false;
+     out.assign(std::istreambuf_iterator<char>(f), {});
++#ifdef __ANDROID__
++    if (host::IndonesianGame() && !out.empty()) {
++        auto patches = lang_id::BuildFilePatches(xbox_path, out.size(), [&](uint64_t off, void* dst, size_t len) -> size_t {
++            if (off >= out.size()) return 0;
++            size_t n = std::min(len, out.size() - size_t(off));
++            std::memcpy(dst, out.data() + off, n);
++            return n;
++        });
++        lang_id::ApplyBytePatches(patches, 0, out.data(), out.size());
++    }
++#endif
+     return true;
+ }
+ 
+@@ -420,6 +494,9 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
+     f->xbox = Normalize(name);
+     f->fp = fp;
+     f->delete_on_close = options & 0x1000;  // FILE_DELETE_ON_CLOSE
++#ifdef __ANDROID__
++    if (mode[0] == 'r') AttachLanguagePatches(*f);
++#endif
+     W32(handle_out, NewHandle(f));
+     IoStatus(iosb, kSuccess, info);
+     LOG_FIRST(400, "open %s", name.c_str());
+@@ -449,6 +526,9 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
+         f->fp = std::fopen(host.c_str(), "r+b");
+         if (!f->fp) f->fp = std::fopen(host.c_str(), "rb");
+         if (!f->fp) return kAccessDenied;
++#ifdef __ANDROID__
++        AttachLanguagePatches(*f);
++#endif
+     }
+     (void)options;
+     W32(handle_out, NewHandle(f));
+@@ -489,6 +569,11 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
+         size_t done = f->entry ? MountedDisc()->Read(*f->entry, pos + n, HostPtr(at), chunk)
+                       : write  ? std::fwrite(HostPtr(at), 1, chunk, f->fp)
+                                : std::fread(HostPtr(at), 1, chunk, f->fp);
++#ifdef __ANDROID__
++        if (!write && done > 0 && !f->patches.empty() && host::IndonesianGame()) {
++            lang_id::ApplyBytePatches(f->patches, pos + n, HostPtr(at), done);
++        }
++#endif
+         n += uint32_t(done);
+         if (done < chunk) break;
+     }
 diff --git a/sdk/runtime/xdk/fiber.cpp b/sdk/runtime/xdk/fiber.cpp
 index a1b300e..a22bf8a 100644
 --- a/sdk/runtime/xdk/fiber.cpp
