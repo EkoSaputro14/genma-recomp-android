@@ -1,5 +1,6 @@
 #include "lang_id.h"
 #include "lang_id_data.h"
+#include "lang_id_docs_data.h"
 #include "host.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -287,6 +289,242 @@ bool EndsWith(const std::string& s, const char* suffix) {
     return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
 }
 
+const data::DocTranslation* FindDocTranslation(const std::string& lower) {
+    for (size_t i = 0; i < data::kDocTranslationCount; ++i) {
+        const auto& d = data::kDocTranslations[i];
+        std::string fname(d.filename);
+        if (lower == fname || EndsWith(lower, ("/" + fname).c_str())) {
+            return &d;
+        }
+    }
+    return nullptr;
+}
+
+void ResolveDocPaletteIndices(const uint8_t* pal64, uint8_t& idx_bright, uint8_t& idx_aa_hi, uint8_t& idx_aa_lo,
+                              uint8_t& idx_outline) {
+    struct Entry {
+        uint8_t idx;
+        int lum;
+    };
+    std::vector<Entry> grays;
+    std::vector<Entry> opaques;
+    for (int i = 1; i < 16; ++i) {
+        const uint8_t* c = pal64 + i * 4;
+        if (c[3] < 32) continue;
+        int r = c[0], g = c[1], b = c[2];
+        int lum = (r + g + b) / 3;
+        opaques.push_back({uint8_t(i), lum});
+        int spread = std::max({r, g, b}) - std::min({r, g, b});
+        if (spread <= 16) {
+            grays.push_back({uint8_t(i), lum});
+        }
+    }
+    const auto& pool = grays.size() >= 2 ? grays : opaques;
+    if (pool.empty()) {
+        idx_bright = idx_aa_hi = idx_aa_lo = idx_outline = 1;
+        return;
+    }
+    auto pick_closest = [&](int target) -> uint8_t {
+        uint8_t best_idx = pool.front().idx;
+        int best_dist = std::abs(pool.front().lum - target);
+        for (const auto& e : pool) {
+            int dist = std::abs(e.lum - target);
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx = e.idx;
+            }
+        }
+        return best_idx;
+    };
+    int max_lum = pool.front().lum;
+    int min_lum = pool.front().lum;
+    idx_bright = pool.front().idx;
+    idx_outline = pool.front().idx;
+    for (const auto& e : pool) {
+        if (e.lum > max_lum) {
+            max_lum = e.lum;
+            idx_bright = e.idx;
+        }
+        if (e.lum < min_lum) {
+            min_lum = e.lum;
+            idx_outline = e.idx;
+        }
+    }
+    idx_aa_hi = pick_closest(min_lum + ((max_lum - min_lum) * 62) / 100);
+    idx_aa_lo = pick_closest(min_lum + ((max_lum - min_lum) * 32) / 100);
+}
+
+std::vector<BytePatch> BuildDocOimPatches(const data::DocTranslation& doc, uint64_t file_size,
+                                          const ReadRangeFn& reader) {
+    std::vector<BytePatch> result;
+    if (doc.font_idx >= data::kDocFontCount) return result;
+
+    uint8_t link_head[8]{};
+    if (reader(0, link_head, sizeof(link_head)) != sizeof(link_head) ||
+        std::memcmp(link_head, "LINK", 4) != 0) {
+        return result;
+    }
+    const uint32_t count = ReadU32(link_head + 4);
+    if (count < 1u || count > 256u || 8ull + 12ull > file_size) return result;
+
+    uint8_t sec0_ent[12]{};
+    if (reader(8, sec0_ent, sizeof(sec0_ent)) != sizeof(sec0_ent)) return result;
+    const uint32_t sec_type = ReadU32(sec0_ent + 0);
+    const uint32_t sec_off = ReadU32(sec0_ent + 4);
+    const uint32_t sec_sz = ReadU32(sec0_ent + 8);
+    if (sec_type != 25u || sec_sz < 0x80u || uint64_t(sec_off) + sec_sz > file_size) return result;
+
+    uint8_t oim_hdr[0x80]{};
+    if (reader(sec_off, oim_hdr, sizeof(oim_hdr)) != sizeof(oim_hdr) ||
+        std::memcmp(oim_hdr, "OIM ", 4) != 0) {
+        return result;
+    }
+    const uint8_t ntex = oim_hdr[0x0B];
+    const uint8_t npal = oim_hdr[0x0C];
+    if (doc.tex_idx >= ntex || npal == 0) return result;
+
+    const size_t tex_ent_off = 0x10u + size_t(doc.tex_idx) * 16u;
+    const size_t pal_ent_off = 0x10u + size_t(ntex) * 16u;
+    if (pal_ent_off + 16u > sizeof(oim_hdr)) return result;
+
+    const uint8_t w_shift = oim_hdr[tex_ent_off + 0];
+    const uint8_t h_shift = oim_hdr[tex_ent_off + 1];
+    const uint8_t fmt = oim_hdr[tex_ent_off + 2];
+    const uint32_t toff = ReadU32(oim_hdr + tex_ent_off + 4);
+    const uint32_t tsz = ReadU32(oim_hdr + tex_ent_off + 8);
+    if (w_shift != 9u || h_shift != 10u || fmt != 0x14u || tsz != 262144u ||
+        uint64_t(toff) + tsz > sec_sz) {
+        return result;
+    }
+
+    const uint32_t poff = ReadU32(oim_hdr + pal_ent_off + 4);
+    const uint32_t psz = ReadU32(oim_hdr + pal_ent_off + 8);
+    if (uint64_t(doc.pal_idx + 1u) * 64ull > psz || uint64_t(poff) + psz > sec_sz) return result;
+
+    uint8_t pal64[64]{};
+    const uint64_t pal_file_off = uint64_t(sec_off) + poff + uint64_t(doc.pal_idx) * 64ull;
+    if (reader(pal_file_off, pal64, sizeof(pal64)) != sizeof(pal64)) return result;
+
+    uint8_t idx_bright = 1, idx_aa_hi = 1, idx_aa_lo = 1, idx_outline = 1;
+    ResolveDocPaletteIndices(pal64, idx_bright, idx_aa_hi, idx_aa_lo, idx_outline);
+
+    const auto& font = data::kDocFonts[doc.font_idx];
+    std::vector<uint8_t> alpha(512u * 1024u, 0);
+
+    const int max_w = int(doc.x1) - int(doc.x0);
+    const int space_w = int(font.glyphs[0].advance);
+    int cy = int(doc.y0);
+    int max_bottom = cy;
+
+    auto word_width = [&](const char* w, size_t len) -> int {
+        int tot = 0;
+        for (size_t i = 0; i < len; ++i) {
+            uint8_t ch = uint8_t(w[i]);
+            if (ch >= 0x20u && ch <= 0x7Eu) {
+                tot += int(font.glyphs[ch - 0x20u].advance);
+            }
+        }
+        return tot;
+    };
+
+    const char* p = doc.text;
+    while (p && *p) {
+        const char* nl = std::strchr(p, '\n');
+        const size_t line_len = nl ? size_t(nl - p) : std::strlen(p);
+        if (line_len == 0) {
+            cy += int(font.para_gap);
+        } else {
+            int cx = 0;
+            bool first_word = true;
+            size_t pos = 0;
+            while (pos < line_len) {
+                while (pos < line_len && p[pos] == ' ') pos++;
+                if (pos >= line_len) break;
+                size_t end = pos;
+                while (end < line_len && p[end] != ' ') end++;
+                const int ww = word_width(p + pos, end - pos);
+                if (!first_word) {
+                    if (cx + space_w + ww <= max_w) {
+                        cx += space_w;
+                    } else {
+                        cy += int(font.line_h);
+                        cx = 0;
+                    }
+                }
+                first_word = false;
+                for (size_t i = pos; i < end; ++i) {
+                    uint8_t ch = uint8_t(p[i]);
+                    if (ch < 0x20u || ch > 0x7Eu) continue;
+                    const auto& g = font.glyphs[ch - 0x20u];
+                    const uint8_t* gp = data::kDocFontPixels + g.offset;
+                    for (int gy = 0; gy < int(g.h); ++gy) {
+                        const int dy = cy + int(g.yoff) + gy;
+                        if (dy < 0 || dy >= 1024) continue;
+                        if (dy + 1 > max_bottom) max_bottom = dy + 1;
+                        for (int gx = 0; gx < int(g.w); ++gx) {
+                            const int dx = int(doc.x0) + cx + int(g.xoff) + gx;
+                            if (dx < 0 || dx >= 512) continue;
+                            const uint32_t pi = uint32_t(gy * int(g.w) + gx);
+                            const uint8_t lv = (gp[pi >> 2] >> ((pi & 3u) * 2u)) & 3u;
+                            if (lv > alpha[size_t(dy) * 512u + size_t(dx)]) {
+                                alpha[size_t(dy) * 512u + size_t(dx)] = lv;
+                            }
+                        }
+                    }
+                    cx += int(g.advance);
+                }
+                pos = end;
+            }
+            cy += int(font.line_h);
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+
+    const int scan_h = std::min(1024, std::max(cy + int(font.line_h), max_bottom) + 4);
+    std::vector<uint8_t> tex_out(262144u, 0);
+    for (int y = 0; y < scan_h; ++y) {
+        for (int x = 0; x < 512; ++x) {
+            const uint8_t a = alpha[size_t(y) * 512u + size_t(x)];
+            uint8_t ci = 0;
+            if (a == 3u) {
+                ci = idx_bright;
+            } else if (a == 2u) {
+                ci = idx_aa_hi;
+            } else if (a == 1u) {
+                ci = idx_aa_lo;
+            } else {
+                bool near_stroke = false;
+                for (int oy = -2; oy <= 2 && !near_stroke; ++oy) {
+                    const int ny = y + oy;
+                    if (ny < 0 || ny >= 1024) continue;
+                    for (int ox = -2; ox <= 2; ++ox) {
+                        if (ox * ox + oy * oy > 4) continue;
+                        const int nx = x + ox;
+                        if (nx >= 0 && nx < 512 && alpha[size_t(ny) * 512u + size_t(nx)] >= 2u) {
+                            near_stroke = true;
+                            break;
+                        }
+                    }
+                }
+                if (near_stroke) ci = idx_outline;
+            }
+            if (ci != 0) {
+                const size_t bo = size_t(y) * 256u + size_t(x >> 1);
+                tex_out[bo] |= (x & 1) ? uint8_t(ci << 4) : ci;
+            }
+        }
+    }
+
+    result.push_back(BytePatch{uint64_t(sec_off) + toff, std::move(tex_out)});
+    static std::atomic<int> logged_docs{0};
+    if (logged_docs.fetch_add(1) < 24) {
+        LOGR("lang_id: patched doc OIM %s tex[%u] pal[%u] (y<=%d/%u)", doc.filename, unsigned(doc.tex_idx),
+             unsigned(doc.pal_idx), max_bottom + 2, unsigned(doc.y_max));
+    }
+    return result;
+}
+
 }  // namespace
 
 void OnXbeLoaded() {
@@ -360,6 +598,8 @@ std::vector<BytePatch> BuildFilePatches(const std::string& xbox_path, uint64_t f
     } else if (EndsWith(lower, "/e_title.ldt") || EndsWith(lower, "/title.ldt") ||
                lower == "e_title.ldt" || lower == "title.ldt") {
         target_sec = 2;
+    } else if (const auto* doc = FindDocTranslation(lower)) {
+        return BuildDocOimPatches(*doc, file_size, reader);
     } else {
         return result;
     }
