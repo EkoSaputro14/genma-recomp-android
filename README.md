@@ -21,7 +21,7 @@
   - CPU DXT1/DXT3/DXT5 texture decode fallback when hardware BC texture compression is unavailable (`vulkan: BC textures unavailable`).
 - **Built-in Touch Controls + Gamepad Support**: Multi-touch virtual Xbox overlay (`Stick`, `D-Pad`, `A/B/X/Y`, `LB/LT/RB/RT`, `BACK/START`, `PAD` visibility toggle, and interactive `CFG` drag/resize layout editor) plus SDL3 & Android OEM controller support.
 - **16:9 / Full-Screen No-Stretch ("Tanpa Gepeng") + Upscaling (`v0.8.0-android.11`)**: Keeps exact 1:1 square pixels via configurable vertical framing (`Top / Center / Subtitle-Safe / Bottom`) alongside `0.75x–3x` internal resolution upscaling, while keeping `4:3 (1x Native)` untouched as default.
-- **Bahasa Indonesia Localization (`v0.8.0-android.12`)**: Switch between **English (Default)** and **Bahasa Indonesia** for both the Android app UI and in-game text/subtitles (cutscene subtitles, room dialogues, item names/descriptions, save prompts, and choices) at runtime without modifying your `.iso` (with full 2-byte `0xF0 <arg>` opcode/timer preservation), plus layered `lang/id/` and `mods/` VFS overrides.
+- **Bahasa Indonesia Localization (`v0.8.0-android.13`)**: Switch between **English (Default)** and **Bahasa Indonesia** for the Android app UI, in-game dialogue/cutscene subtitles, item names/descriptions, choices (`0xF0 <arg>`-safe), and **all 19 in-game image-based documents** (*Yuki's Letter*, *Instructions A/B/C*, *Sougen's Note*, *Journals #1–#6*, *Blue/Red/Demon King Books* rendered on-the-fly into 4bpp `OIM ` overlays without touching Ogre puzzle cipher keys or your `.iso`), plus layered `lang/id/` and `mods/` VFS overrides.
 
 ---
 
