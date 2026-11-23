@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Tag versi rilis Android (contoh: v0.8.0-android.9)'
+        description: 'Tag versi rilis Android (contoh: v0.8.0-android.10)'
         required: true
-        default: 'v0.8.0-android.9'
+        default: 'v0.8.0-android.10'
         type: string
       publish_release:
         description: 'Publikasikan langsung ke GitHub Releases'
@@ -124,7 +124,7 @@ jobs:
         run: |
           VERSION="${{ inputs.release_version || github.ref_name }}"
           if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
-            VERSION="v0.8.0-android.9"
+            VERSION="v0.8.0-android.10"
           fi
           CLEAN_NAME="${VERSION#v}"
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
@@ -166,12 +166,15 @@ jobs:
           body: |
             ### Genma Onimusha — Android ARM64 Port (${{ steps.ver.outputs.tag }})
 
-            > **Catatan Pembaruan (Upgrade Note)**: Jika Anda menginstal rilis sebelumnya (`v0.8.0-android.8` atau lebih lama), **uninstall terlebih dahulu APK lama** sebelum menginstal APK ini (karena rilis CI sebelumnya menggunakan debug keystore sementara). Mulai versi ini `android:hasFragileUserData="true"` diaktifkan agar Android menawarkan opsi menyimpan data saat uninstall.
+            > **Catatan Pembaruan**: Semua pengaturan grafis dan tata letak kontroler default pada versi ini identik 100% dengan `v0.8.0-android.9` (`1x` Native 480p, `4:3`, V-Sync On, 60 FPS, Bilinear) agar kompatibilitas dan performa baseline tetap terjaga. Jika Anda masih memakai build debug keystore yang berbeda sebelumnya, uninstall APK lama terlebih dahulu (`hasFragileUserData="true"` sudah aktif sejak `.9`).
 
-            - **Perbaikan utama pada rilis ini**:
-              - **Mali-G52 / Bifrost Vulkan Sync Fix (`vulkan.cpp`)**: Menambahkan explicit `VkImageMemoryBarrier` (`TRANSFER_WRITE -> TRANSFER_WRITE`) antara `vkCmdClearColorImage` dan `vkCmdBlitImage` di `Present()` untuk mencegah WAW hazard layar hitam/berkedip pada GPU tile-based ARM Mali, menyelaraskan `srcStageMask` acquire swapchain dengan wait stage semaphore `f.acquired` (`VK_PIPELINE_STAGE_TRANSFER_BIT`), serta menjaga barrier `TRANSFER_DST_OPTIMAL` di `Layout()`.
-              - **RenderPass External Subpass Dependencies (`vulkan.cpp`)**: Menambahkan `VkSubpassDependency` (`VK_SUBPASS_EXTERNAL <-> subpass 0`) pada `Pass()` agar render pass berurutan pada Mali ter-serialisasi sesuai spesifikasi Vulkan.
-              - **Present & Surface Diagnostics (`vulkan.cpp`)**: Mengangkat log `surface lost` / `OUT_OF_DATE` / `deferred surface` ke `LOGR` agar tercatat di `genma.log` build Release, ditambah info `blit_dst` swapchain dan konfirmasi `vulkan: first frame presented`.
+            - **Fitur Baru pada Rilis Ini**:
+              - **Customisasi Kontroler Layar Touch Screen (`CFG` -> Edit Touch Layout / Preferences)**:
+                - Mode edit interaktif langsung di atas layar: geser posisi setiap tombol (`L`, `DPAD`, `A/B/X/Y`, `LB/LT/RT/RB`, `BACK/START`, `PAD`, `CFG`), ubah ukuran per tombol (`60%–180%`), sembunyikan/tampilkan tombol individu, pindah posisi toolbar (`Top/Bot`), serta tombol **Reset / Cancel / Save**.
+                - Pengaturan global overlay: **Opacity (`20%–100%`)**, **Global Button Scale (`70%–150%`)**, dan toggle visibilitas yang tersimpan otomatis (`SharedPreferences`).
+              - **Pengaturan Grafis & Upscaling Recomp (`CFG` -> Graphics & Upscale Settings)**:
+                - **Internal Resolution Upscale**: `0.75x (360p Performance)`, `1x (480p Native — Default)`, `1.5x (720p HD)`, `2x (960p FHD)`, `2.5x (1200p)`, `3x (1440p QHD)` lengkap dengan scaling depth/stencil, viewport/scissor, occlusion query, `spreadtap`, `rtshift`, dan readback `Sync()` yang aman.
+                - **Opsi Grafis Recomp Standar**: **Display Scaling Filter** (`Bilinear` default / `Nearest`), **Anisotropic Filtering** (`Off` default hingga batas GPU `2x–16x`), **Aspect Ratio** (`4:3` default, `16:9`, `Auto`, `Stretch`), **Overscan Crop** (`3.3%` default, `0%`, `5.0%`), **FPS Cap** (`60` default, `30`, `120`, `Unlimited`), **V-Sync**, **Precise Depth Fix**, **Stable Point Sampling**, dan **Modern Analog Controls**, tersimpan ke `settings.toml` & `SharedPreferences`.
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`, 16 KB page-aligned
           files: |
             release-dist/*.apk

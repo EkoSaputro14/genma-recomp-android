@@ -15,5 +15,15 @@ uint32_t SurfaceEpoch();
 void WaitForeground();
 // Current drawable surface dimensions in physical pixels.
 void WindowPixels(int& w, int& h);
+// Internal resolution multiplier relative to guest surface size (default 1.0f = 1x native 480p).
+float RenderScale();
+void SetRenderScale(float scale);
+// Present blit filter: false = bilinear (default), true = nearest (sharp).
+bool NearestPresent();
+void SetNearestPresent(bool nearest);
+// GPU capabilities reported by Vulkan::Init() for the Android settings UI.
+void SetGpuCaps(float max_aniso, uint32_t max_image_dim);
+float MaxAniso();
+uint32_t MaxImageDim();
 
 }  // namespace host

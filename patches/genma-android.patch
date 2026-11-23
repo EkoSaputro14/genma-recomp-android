@@ -488,7 +488,7 @@ index 3ebd900..70eb733 100644
          out.elements[size_t(inputs.regs[k])] = {DXGI_FORMAT_R32G32B32A32_FLOAT, 0, uint16_t(k * 16)};
      }
 diff --git a/sdk/runtime/gpu/vulkan.cpp b/sdk/runtime/gpu/vulkan.cpp
-index fc93631..5f15c22 100644
+index fc93631..261a250 100644
 --- a/sdk/runtime/gpu/vulkan.cpp
 +++ b/sdk/runtime/gpu/vulkan.cpp
 @@ -5,6 +5,7 @@
@@ -543,7 +543,7 @@ index fc93631..5f15c22 100644
      case Host::R32F:
          return VK_FORMAT_R32_SFLOAT;
      case Host::R16Unorm:
-@@ -154,6 +162,27 @@ VkFormat FormatOf(Host h) {
+@@ -154,22 +162,101 @@ VkFormat FormatOf(Host h) {
          Fail("unsupported texture format");
      }
  }
@@ -571,12 +571,13 @@ index fc93631..5f15c22 100644
  struct Image {
      VkImage image{};
      VkDeviceMemory memory{};
-@@ -161,15 +190,72 @@ struct Image {
+     VkImageView view{}, sample{};
      VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
      VkFormat format{};
-     uint32_t w = 0, h = 0, depth = 1, levels = 1, layers = 1;
+-    uint32_t w = 0, h = 0, depth = 1, levels = 1, layers = 1;
 -    bool z = false, drawn = false;
 -    uint64_t epoch = ~0ull, signature = 0, used = 0;
++    uint32_t w = 0, h = 0, gw = 0, gh = 0, depth = 1, levels = 1, layers = 1;
 +    bool z = false, drawn = false, is_target = false;
 +    uint64_t epoch = ~0ull, signature = 0, palette_hash = 0, used = 0, checked_frame = 0;
      TextureDesc desc{};
@@ -586,7 +587,8 @@ index fc93631..5f15c22 100644
 +    bool is_report = false;
 +    uint32_t va = 0, first = 0, end = 0;
 +    uint64_t frame = 0, epoch = 0;
-+};
++    float pixel_scale = 1.0f;
+ };
 +struct FrameSlot {
 +    VkCommandPool pool{};
 +    VkCommandBuffer cmd{};
@@ -600,9 +602,9 @@ index fc93631..5f15c22 100644
 +    std::vector<std::unique_ptr<Image>> retire;
 +};
 +struct PipelineKey {
-+    std::array<uint64_t, 27> v{};
++    std::array<uint64_t, 28> v{};
 +    bool operator==(const PipelineKey &o) const { return v == o.v; }
- };
++};
 +struct PipelineKeyHash {
 +    size_t operator()(const PipelineKey &k) const { return size_t(Hash(k.v.data(), sizeof(k.v))); }
 +};
@@ -646,7 +648,7 @@ index fc93631..5f15c22 100644
      VkInstance instance_{};
      VkSurfaceKHR surface_{};
      VkPhysicalDevice physical_{};
-@@ -177,47 +263,71 @@ class Vulkan final : public Backend {
+@@ -177,54 +264,90 @@ class Vulkan final : public Backend {
      VkQueue queue_{};
      uint32_t family_ = 0;
      VkPhysicalDeviceMemoryProperties memory_{};
@@ -697,14 +699,21 @@ index fc93631..5f15c22 100644
 +    std::unordered_map<uint64_t, uint64_t> epoch_sum_;
 +    uint32_t completed_fence_ = 0;
 +    Assembled asm_{};
-+    std::vector<uint8_t> decode_pixels_, decode_bgra_, stencil_u8_;
-+    std::vector<uint32_t> depth_u32_;
-+    std::vector<float> depth_f32_;
++    std::vector<uint8_t> decode_pixels_, decode_bgra_, stencil_u8_, scaled_stencil_u8_;
++    std::vector<uint32_t> depth_u32_, scaled_depth_u32_;
++    std::vector<float> depth_f32_, scaled_depth_f32_;
 +    PerfWindow perf_{};
 +    std::chrono::steady_clock::time_point log_time_{std::chrono::steady_clock::now()};
      uint8_t gamma_[768]{};
      bool gamma_identity_ = true;
 +    bool bc_supported_ = true;
++    bool aniso_supported_ = false;
++    bool large_points_ = false;
++    bool vsync_active_ = true;
++    float scale_ = 1.0f;
++    float max_aniso_ = 1.0f;
++    float max_point_size_ = 1.0f;
++    uint32_t max_image_dim_ = 4096;
 +    VkFormat depth_format_ = VK_FORMAT_D24_UNORM_S8_UINT;
 +    bool rendering_ = false;
 +    Image *rend_color_ = nullptr, *rend_depth_ = nullptr;
@@ -717,6 +726,9 @@ index fc93631..5f15c22 100644
 +    VkCommandBuffer Cmd() { return slots_[slot_].cmd; }
 +    uint32_t QueryBase() const { return slot_ * 4096; }
      uint32_t MemoryType(uint32_t allowed, VkMemoryPropertyFlags flags);
++    std::pair<uint32_t, uint32_t> ScaledExtent(uint32_t gw, uint32_t gh) const;
++    void BlitImage(Image &src, Image &dst, VkFilter filter);
++    void ApplyGraphicsSettings();
      void Begin();
 -    void Submit(VkSemaphore wait = VK_NULL_HANDLE);
 +    void EndRender();
@@ -735,9 +747,21 @@ index fc93631..5f15c22 100644
 +    bool EnsureGammaResources(uint32_t w, uint32_t h);
 +    Image *Target(const Surface &, bool, bool sync_dirty = true);
      Image *Texture(uint32_t, uint32_t);
-     VkSampler Sampler(const State &, int, bool);
+-    VkSampler Sampler(const State &, int, bool);
++    VkSampler Sampler(const State &, int, bool, uint32_t mip_levels);
      VkRenderPass Pass(bool, bool);
-@@ -241,15 +351,49 @@ class Vulkan final : public Backend {
+     VkFramebuffer Framebuffer(Image *, Image *, VkRenderPass);
+     VkShaderModule Shader(std::string, bool, uint64_t &);
+-    VkPipeline Pipeline(const State &, const Assembled &, VkRenderPass, bool, bool, uint64_t, uint64_t);
+-    void Constants(const State &, uint32_t, uint32_t, const TexInfo *, DrawConstants &);
++    VkPipeline Pipeline(const State &, const Assembled &, VkRenderPass, bool, bool, uint64_t, uint64_t,
++                        float depth_scale);
++    void Constants(const State &, uint32_t, uint32_t, const TexInfo *, float target_scale, const float *wide_k,
++                   DrawConstants &);
+     void Resize();
+     void Read(Image &, std::vector<uint8_t> &);
+     void Capture(Image &);
+@@ -241,15 +364,49 @@ class Vulkan final : public Backend {
          LOG_FIRST(1, "vulkan: synchronous development readback for NOOVERWRITE");
          Sync(d, 0);
      }
@@ -765,8 +789,7 @@ index fc93631..5f15c22 100644
 +            CurrentSlot().fence_id = std::max(CurrentSlot().fence_id, id);
 +        }
 +        return id;
-     }
--    void WaitResource(uint32_t) override { Submit(); }
++    }
 +    bool FencePending(uint32_t id) override { return id > completed_fence_; }
 +    void WaitFence(uint32_t id) override {
 +        if (id <= completed_fence_)
@@ -778,27 +801,33 @@ index fc93631..5f15c22 100644
 +                return;
 +        }
 +        Drain();
-+    }
+     }
+-    void WaitResource(uint32_t) override { Submit(); }
 +    void WaitResource(uint32_t) override { perf_.wres++; }
      void SetGamma(const uint8_t *r) override;
      void ClearReport() override {
 -        report_first_ = query_next_;
 +        FrameSlot &f = CurrentSlot();
 +        if (f.query_next > f.report_first) {
-+            f.events.push_back({false, 0, f.report_first, f.query_next, frame_, report_epoch_});
++            f.events.push_back({false, 0, f.report_first, f.query_next, frame_, report_epoch_, scale_ * scale_});
 +            f.report_first = f.query_next;
 +        }
 +        ++report_epoch_;
          query_sum_ = 0;
      }
      void GetReport(uint32_t) override;
-@@ -308,13 +452,45 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
+@@ -308,13 +465,54 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
      vkGetPhysicalDeviceMemoryProperties(physical_, &memory_);
      VkPhysicalDeviceFeatures features{};
      vkGetPhysicalDeviceFeatures(physical_, &features);
 -    if (!features.textureCompressionBC)
 -        Fail("BC textures unavailable");
 +    bc_supported_ = features.textureCompressionBC == VK_TRUE;
++    aniso_supported_ = features.samplerAnisotropy == VK_TRUE;
++    max_aniso_ = aniso_supported_ ? std::max(1.0f, prop.limits.maxSamplerAnisotropy) : 1.0f;
++    large_points_ = features.largePoints == VK_TRUE;
++    max_point_size_ = large_points_ ? std::max(1.0f, prop.limits.pointSizeRange[1]) : 1.0f;
++    max_image_dim_ = std::max(prop.limits.maxImageDimension2D, 2048u);
 +    if (!bc_supported_) {
 +        LOGR("vulkan: BC textures unavailable; enabling CPU DXT1/3/5 decode fallback");
 +    }
@@ -831,17 +860,21 @@ index fc93631..5f15c22 100644
      VkPhysicalDeviceFeatures enable{};
 -    enable.textureCompressionBC = VK_TRUE;
 +    enable.textureCompressionBC = bc_supported_ ? VK_TRUE : VK_FALSE;
++    enable.samplerAnisotropy = aniso_supported_ ? VK_TRUE : VK_FALSE;
++    enable.largePoints = large_points_ ? VK_TRUE : VK_FALSE;
      enable.independentBlend = features.independentBlend;
      enable.fillModeNonSolid = features.fillModeNonSolid;
      enable.occlusionQueryPrecise = features.occlusionQueryPrecise;
 +#ifdef __ANDROID__
 +    vkshader::Init(app::CacheDir() / "shader-cache-vulkan");
 +    surface_epoch_ = host::SurfaceEpoch();
++    host::SetGpuCaps(max_aniso_, max_image_dim_);
++    scale_ = host::RenderScale();
 +#endif
      float priority = 1;
      VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
      qi.queueFamilyIndex = family_;
-@@ -329,19 +505,6 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
+@@ -329,19 +527,6 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
      di.pEnabledFeatures = &enable;
      Check(vkCreateDevice(physical_, &di, nullptr, &device_), "create device");
      vkGetDeviceQueue(device_, family_, 0, &queue_);
@@ -861,7 +894,7 @@ index fc93631..5f15c22 100644
      VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
      bi.size = kArena;
      bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-@@ -379,11 +542,28 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
+@@ -379,11 +564,28 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
      VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768},
                                      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 65536},
                                      {VK_DESCRIPTOR_TYPE_SAMPLER, 65536}};
@@ -895,15 +928,17 @@ index fc93631..5f15c22 100644
      VkQueryPoolCreateInfo qp{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
      qp.queryType = VK_QUERY_TYPE_OCCLUSION;
      qp.queryCount = 8192;
-@@ -397,62 +577,171 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
+@@ -397,68 +599,179 @@ bool Vulkan::Init(uint32_t w, uint32_t h) {
      cp.bufferOffset = off;
      cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
      cp.imageExtent = {1, 1, 1};
 -    vkCmdCopyBufferToImage(cmd_, arena_, white_->image, white_->layout, 1, &cp);
 +    vkCmdCopyBufferToImage(Cmd(), arena_, white_->image, white_->layout, 1, &cp);
      Layout(*white_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-     LOGR("vulkan: %s, guest %ux%u; experimental native-resolution renderer", prop.deviceName, w, h);
-     LOGR("vulkan: HD texture replacements and settings menu are not implemented in this development backend");
+-    LOGR("vulkan: %s, guest %ux%u; experimental native-resolution renderer", prop.deviceName, w, h);
+-    LOGR("vulkan: HD texture replacements and settings menu are not implemented in this development backend");
++    LOGR("vulkan: %s, guest %ux%u, scale %.2fx, max_aniso %.0f, max_dim %u",
++         prop.deviceName, w, h, scale_, max_aniso_, max_image_dim_);
      Resize();
      return true;
  }
@@ -914,7 +949,7 @@ index fc93631..5f15c22 100644
 +    Check(vkWaitForFences(device_, 1, &f.fence, VK_TRUE, 30000000000ull), "GPU wait");
 +    perf_.wait_ns += NowNs() - t0;
 +    if (f.query_next > f.report_first) {
-+        f.events.push_back({false, 0, f.report_first, f.query_next, frame_, report_epoch_});
++        f.events.push_back({false, 0, f.report_first, f.query_next, frame_, report_epoch_, scale_ * scale_});
 +        f.report_first = f.query_next;
 +    }
 +    if (f.query_next > 0) {
@@ -928,6 +963,8 @@ index fc93631..5f15c22 100644
 +                uint64_t span_sum = 0;
 +                for (uint32_t qi = ev.first; qi < ev.end && qi < results.size(); qi++)
 +                    span_sum += results[qi];
++                if (std::fabs(ev.pixel_scale - 1.0f) > 0.01f && span_sum > 0)
++                    span_sum = std::max<uint64_t>(1, uint64_t(std::llround(double(span_sum) / double(ev.pixel_scale))));
 +                epoch_sum_[ev.epoch] += span_sum;
 +                if (ev.epoch == report_epoch_)
 +                    query_sum_ += span_sum;
@@ -1027,7 +1064,7 @@ index fc93631..5f15c22 100644
 -    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 +    }
 +    if (f.query_next > f.report_first) {
-+        f.events.push_back({false, 0, f.report_first, f.query_next, frame_, report_epoch_});
++        f.events.push_back({false, 0, f.report_first, f.query_next, frame_, report_epoch_, scale_ * scale_});
 +        f.report_first = f.query_next;
 +    }
 +    Check(vkEndCommandBuffer(f.cmd), "end command buffer");
@@ -1101,7 +1138,15 @@ index fc93631..5f15c22 100644
  }
  std::unique_ptr<Image> Vulkan::MakeImage(uint32_t w, uint32_t h, uint32_t depth, uint32_t levels, uint32_t layers,
                                           VkFormat format, bool z, bool target) {
-@@ -503,100 +792,316 @@ std::unique_ptr<Image> Vulkan::MakeImage(uint32_t w, uint32_t h, uint32_t depth,
+     auto t = std::make_unique<Image>();
+-    t->w = w;
+-    t->h = h;
++    t->w = t->gw = w;
++    t->h = t->gh = h;
+     t->depth = depth;
+     t->levels = levels;
+     t->layers = layers;
+@@ -503,137 +816,442 @@ std::unique_ptr<Image> Vulkan::MakeImage(uint32_t w, uint32_t h, uint32_t depth,
      return t;
  }
  void Vulkan::DestroyImage(Image &t) {
@@ -1272,6 +1317,22 @@ index fc93631..5f15c22 100644
          }
      Layout(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
  }
++std::pair<uint32_t, uint32_t> Vulkan::ScaledExtent(uint32_t gw, uint32_t gh) const {
++    if (std::fabs(scale_ - 1.0f) <= 1e-4f)
++        return {gw, gh};
++    return {std::clamp(uint32_t(std::lround(gw * scale_)), 1u, max_image_dim_),
++            std::clamp(uint32_t(std::lround(gh * scale_)), 1u, max_image_dim_)};
++}
++void Vulkan::BlitImage(Image &src, Image &dst, VkFilter filter) {
++    Layout(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    Layout(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    EndRender();
++    VkImageBlit blit{};
++    blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++    blit.srcOffsets[1] = {int32_t(src.w), int32_t(src.h), 1};
++    blit.dstOffsets[1] = {int32_t(dst.w), int32_t(dst.h), 1};
++    vkCmdBlitImage(Cmd(), src.image, src.layout, dst.image, dst.layout, 1, &blit, filter);
++}
  void Vulkan::UploadDepth(Image &image, const TextureDesc &d) {
 -    std::vector<uint8_t> decoded;
 -    uint32_t pitch = 0;
@@ -1451,34 +1512,80 @@ index fc93631..5f15c22 100644
 -    copy.imageExtent = {d.width, d.height, 1};
 -    copy.bufferOffset = Upload(depth.data(), depth.size() * 4);
 -    vkCmdCopyBufferToImage(cmd_, arena_, image.image, image.layout, 1, &copy);
-+    copy.imageExtent = {w, h, 1};
-+    copy.bufferOffset = is_float_ds
-+        ? Upload(depth_f32_.data(), depth_f32_.size() * sizeof(float))
-+        : Upload(depth_u32_.data(), depth_u32_.size() * sizeof(uint32_t));
-+    vkCmdCopyBufferToImage(Cmd(), arena_, image.image, image.layout, 1, &copy);
-     copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+-    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
 -    copy.bufferOffset = Upload(stencil.data(), stencil.size());
 -    vkCmdCopyBufferToImage(cmd_, arena_, image.image, image.layout, 1, &copy);
 -    image.signature = Hash(guest, TotalSize(d));
-+    copy.bufferOffset = Upload(stencil_u8_.data(), stencil_u8_.size());
-+    vkCmdCopyBufferToImage(Cmd(), arena_, image.image, image.layout, 1, &copy);
++    if (image.w == w && image.h == h) {
++        copy.imageExtent = {w, h, 1};
++        copy.bufferOffset = is_float_ds
++            ? Upload(depth_f32_.data(), depth_f32_.size() * sizeof(float))
++            : Upload(depth_u32_.data(), depth_u32_.size() * sizeof(uint32_t));
++        vkCmdCopyBufferToImage(Cmd(), arena_, image.image, image.layout, 1, &copy);
++        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++        copy.bufferOffset = Upload(stencil_u8_.data(), stencil_u8_.size());
++        vkCmdCopyBufferToImage(Cmd(), arena_, image.image, image.layout, 1, &copy);
++    } else {
++        const uint32_t hw = image.w, hh = image.h;
++        const size_t htotal = size_t(hw) * hh;
++        thread_local std::vector<uint32_t> sx_lut;
++        sx_lut.resize(hw);
++        for (uint32_t x = 0; x < hw; x++)
++            sx_lut[x] = std::min(uint32_t(uint64_t(x) * w / hw), w - 1);
++        scaled_stencil_u8_.resize(htotal);
++        if (is_float_ds) {
++            scaled_depth_f32_.resize(htotal);
++            for (uint32_t y = 0; y < hh; y++) {
++                const uint32_t sy = std::min(uint32_t(uint64_t(y) * h / hh), h - 1);
++                const size_t srow = size_t(sy) * w;
++                const size_t drow = size_t(y) * hw;
++                for (uint32_t x = 0; x < hw; x++) {
++                    const size_t si = srow + sx_lut[x];
++                    scaled_depth_f32_[drow + x] = depth_f[si];
++                    scaled_stencil_u8_[drow + x] = stencil[si];
++                }
++            }
++            copy.bufferOffset = Upload(scaled_depth_f32_.data(), scaled_depth_f32_.size() * sizeof(float));
++        } else {
++            scaled_depth_u32_.resize(htotal);
++            for (uint32_t y = 0; y < hh; y++) {
++                const uint32_t sy = std::min(uint32_t(uint64_t(y) * h / hh), h - 1);
++                const size_t srow = size_t(sy) * w;
++                const size_t drow = size_t(y) * hw;
++                for (uint32_t x = 0; x < hw; x++) {
++                    const size_t si = srow + sx_lut[x];
++                    scaled_depth_u32_[drow + x] = depth[si];
++                    scaled_stencil_u8_[drow + x] = stencil[si];
++                }
++            }
++            copy.bufferOffset = Upload(scaled_depth_u32_.data(), scaled_depth_u32_.size() * sizeof(uint32_t));
++        }
++        copy.imageExtent = {hw, hh, 1};
++        vkCmdCopyBufferToImage(Cmd(), arena_, image.image, image.layout, 1, &copy);
++        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++        copy.bufferOffset = Upload(scaled_stencil_u8_.data(), scaled_stencil_u8_.size());
++        vkCmdCopyBufferToImage(Cmd(), arena_, image.image, image.layout, 1, &copy);
++    }
 +    image.signature = MemSig(d.data, TotalSize(d));
      image.epoch = DirtyEpoch(d.data);
      image.drawn = true;
 -    LOG_FIRST(4, "vulkan: CPU depth imported %08X, %ux%u", d.data, d.width, d.height);
-+    LOG_FIRST(4, "vulkan: CPU depth imported %08X, %ux%u", d.data, w, h);
++    LOG_FIRST(4, "vulkan: CPU depth imported %08X, %ux%u -> %ux%u", d.data, w, h, image.w, image.h);
  }
 -Image *Vulkan::Target(const Surface &s, bool z) {
 +Image *Vulkan::Target(const Surface &s, bool z, bool sync_dirty) {
      if (!s.header)
          return nullptr;
      TextureDesc d;
-@@ -605,35 +1110,44 @@ Image *Vulkan::Target(const Surface &s, bool z) {
+     if (!DescribeSurface(s, d))
+         Fail("invalid surface");
++    auto [tw, th] = ScaledExtent(d.width, d.height);
      uint64_t key = uint64_t(d.data) << 1 | uint64_t(z);
      auto &p = targets_[key];
-     if (p && (p->w != d.width || p->h != d.height)) {
+-    if (p && (p->w != d.width || p->h != d.height)) {
 -        Submit();
 -        for (auto [key, fb] : framebuffers_)
++    if (p && (p->gw != d.width || p->gh != d.height || p->w != tw || p->h != th)) {
 +        Drain();
 +        for (auto [fb_key, fb] : framebuffers_)
              vkDestroyFramebuffer(device_, fb, nullptr);
@@ -1488,7 +1595,9 @@ index fc93631..5f15c22 100644
      }
      if (!p) {
 -        p = MakeImage(d.width, d.height, 1, 1, 1, z ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_B8G8R8A8_UNORM, z, true);
-+        p = MakeImage(d.width, d.height, 1, 1, 1, z ? depth_format_ : VK_FORMAT_B8G8R8A8_UNORM, z, true);
++        p = MakeImage(tw, th, 1, 1, 1, z ? depth_format_ : VK_FORMAT_B8G8R8A8_UNORM, z, true);
++        p->gw = d.width;
++        p->gh = d.height;
          p->desc = d;
 +        p->is_target = true;
 +        Layout(*p, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -1527,14 +1636,33 @@ index fc93631..5f15c22 100644
 +            if (z) {
 +                UploadDepth(*p, d);
 +            } else {
-+                UploadImage(*p, d);
++                if (p->w == d.width && p->h == d.height) {
++                    UploadImage(*p, d);
++                } else {
++                    uint64_t ckey = uint64_t(d.data) << 1;
++                    auto &cached = copy_cache_[ckey];
++                    if (!cached || cached->w != d.width || cached->h != d.height ||
++                        cached->format != VK_FORMAT_B8G8R8A8_UNORM || cached->z) {
++                        if (cached)
++                            CurrentSlot().retire.push_back(std::move(cached));
++                        cached = MakeImage(d.width, d.height, 1, 1, 1, VK_FORMAT_B8G8R8A8_UNORM, false, false);
++                    }
++                    if (cached->signature != sig || !SameTextureDesc(cached->desc, d)) {
++                        cached->desc = d;
++                        UploadImage(*cached, d);
++                        cached->signature = sig;
++                    }
++                    cached->used = frame_;
++                    BlitImage(*cached, *p, VK_FILTER_LINEAR);
++                    Layout(*p, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++                }
 +                p->signature = sig;
 +                p->drawn = false;
 +            }
          }
      }
      return p.get();
-@@ -644,44 +1158,66 @@ Image *Vulkan::Texture(uint32_t header, uint32_t palette) {
+@@ -644,51 +1262,82 @@ Image *Vulkan::Texture(uint32_t header, uint32_t palette) {
      TextureDesc d;
      if (!Describe(header, d))
          Fail("invalid texture");
@@ -1545,7 +1673,7 @@ index fc93631..5f15c22 100644
 +    const FormatInfo &fi = Format(d.format);
 +    if (!d.cube && d.depth == 1 && !fi.compressed) {
 +        auto it = targets_.find(uint64_t(d.data) << 1 | uint64_t(fi.depth));
-+        if (it != targets_.end() && it->second->w == d.width && it->second->h == d.height) {
++        if (it != targets_.end() && it->second->gw == d.width && it->second->gh == d.height) {
 +            it->second->used = frame_;
 +            return it->second.get();
 +        }
@@ -1629,8 +1757,36 @@ index fc93631..5f15c22 100644
 +    p->used = frame_;
      return p.get();
  }
- VkSampler Vulkan::Sampler(const State &s, int stage, bool shadow) {
-@@ -731,7 +1267,7 @@ VkRenderPass Vulkan::Pass(bool color, bool depth) {
+-VkSampler Vulkan::Sampler(const State &s, int stage, bool shadow) {
++VkSampler Vulkan::Sampler(const State &s, int stage, bool shadow, uint32_t mip_levels) {
+     const auto &t = s.tss[size_t(stage)];
+-    std::array<uint32_t, 10> keydata = {t[kTssAddressU],  t[kTssAddressV],    t[kTssAddressW],   t[kTssMagFilter],
++    const bool game_aniso = t[kTssMinFilter] == 3 || t[kTssMagFilter] == 3;
++    uint32_t an = game_aniso ? std::max<uint32_t>(t[kTssMaxAnisotropy], 1u) : 1u;
++    const uint32_t forced_aniso = app::Get().aniso;
++    if (forced_aniso > 1 && t[kTssMinFilter] >= 2 && t[kTssMipFilter] && mip_levels > 1 && !shadow)
++        an = forced_aniso;
++    if (!aniso_supported_ || shadow)
++        an = 1;
++    else
++        an = std::clamp(an, 1u, uint32_t(max_aniso_));
++    std::array<uint32_t, 11> keydata = {t[kTssAddressU],  t[kTssAddressV],    t[kTssAddressW],   t[kTssMagFilter],
+                                         t[kTssMinFilter], t[kTssMipFilter],   t[kTssMipLodBias], t[kTssMaxMipLevel],
+-                                        uint32_t(shadow), s.rs[kRsShadowFunc]};
++                                        uint32_t(shadow), s.rs[kRsShadowFunc], an};
+     uint64_t key = Hash(keydata.data(), sizeof(keydata));
+     auto it = samplers_.find(key);
+     if (it != samplers_.end())
+@@ -703,6 +1352,8 @@ VkSampler Vulkan::Sampler(const State &s, int stage, bool shadow) {
+     ci.minLod = float(t[kTssMaxMipLevel]);
+     ci.maxLod = t[kTssMipFilter] ? 32.0f : ci.minLod;
+     ci.mipLodBias = std::clamp(Bits(t[kTssMipLodBias]), -2.0f, 2.0f);
++    ci.anisotropyEnable = an > 1 ? VK_TRUE : VK_FALSE;
++    ci.maxAnisotropy = an > 1 ? float(an) : 1.0f;
+     ci.compareEnable = shadow;
+     ci.compareOp = Compare(s.rs[kRsShadowFunc]);
+     ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+@@ -731,7 +1382,7 @@ VkRenderPass Vulkan::Pass(bool color, bool depth) {
      }
      if (depth) {
          dr.attachment = n;
@@ -1639,7 +1795,7 @@ index fc93631..5f15c22 100644
          a[n].samples = VK_SAMPLE_COUNT_1_BIT;
          a[n].loadOp = a[n].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
          a[n].storeOp = a[n].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-@@ -743,11 +1279,35 @@ VkRenderPass Vulkan::Pass(bool color, bool depth) {
+@@ -743,11 +1394,35 @@ VkRenderPass Vulkan::Pass(bool color, bool depth) {
      sub.colorAttachmentCount = color ? 1 : 0;
      sub.pColorAttachments = color ? &cr : nullptr;
      sub.pDepthStencilAttachment = depth ? &dr : nullptr;
@@ -1675,7 +1831,22 @@ index fc93631..5f15c22 100644
      VkRenderPass pass;
      Check(vkCreateRenderPass(device_, &ci, nullptr, &pass), "render pass");
      passes_[key] = pass;
-@@ -813,6 +1373,11 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
+@@ -803,16 +1478,24 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
+             replace(decl, "[[vk::location(" + std::to_string(i) + ")]] " + decl);
+         }
+     if (vertex) {
++        const std::string psize = source.find("float4 surf;") != std::string::npos
++                                      ? "max(1.0, surf.w);"
++                                      : "1;";
+         replace("float4 pos : SV_Position;",
+                 "float4 pos : SV_Position; [[vk::builtin(\"PointSize\")]] float pointsize : PSIZE;");
+-        replace("o.pos = q;", "o.pos = q; o.pointsize = 1;");
+-        replace("o.pos = cp;", "o.pos = cp; o.pointsize = 1;");
++        replace("o.pos = q;", "o.pos = q; o.pointsize = " + psize);
++        replace("o.pos = cp;", "o.pos = cp; o.pointsize = " + psize);
+     }
+     replace("1.#INF", "asfloat(0x7f800000u)");
+     key = Hash(source.data(), source.size(), vertex ? 0x564b565330303031ull : 0x564b505330303031ull);
      auto it = shaders_.find(key);
      if (it != shaders_.end())
          return it->second;
@@ -1687,7 +1858,7 @@ index fc93631..5f15c22 100644
      auto dir = app::CacheDir() / "shader-cache-vulkan";
      std::filesystem::create_directories(dir);
      std::string name = std::to_string(key);
-@@ -876,11 +1441,12 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
+@@ -876,11 +1559,12 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
      auto size = f.tellg();
      if (size <= 0 || size % 4)
          Fail("invalid SPIR-V file");
@@ -1701,12 +1872,14 @@ index fc93631..5f15c22 100644
      VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
      ci.codeSize = words.size() * 4;
      ci.pCode = words.data();
-@@ -892,14 +1458,21 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
+@@ -891,15 +1575,23 @@ VkShaderModule Vulkan::Shader(std::string source, bool vertex, uint64_t &key) {
+ }
  
  VkPipeline Vulkan::Pipeline(const State &s, const Assembled &a, VkRenderPass pass, bool color, bool depth, uint64_t vs,
-                             uint64_t ps) {
+-                            uint64_t ps) {
 -    std::vector<uint64_t> key = {
 -        vs, ps, a.regs, uint64_t(a.topology), uint64_t(a.strip), uint64_t(color), uint64_t(depth)};
++                            uint64_t ps, float depth_scale) {
 +    PipelineKey key{};
 +    size_t ki = 0;
 +    key.v[ki++] = vs;
@@ -1724,10 +1897,52 @@ index fc93631..5f15c22 100644
                     kMSlopeScale, kMDepthOffset})
 -        key.push_back(SS(s, n));
 +        key.v[ki++] = SS(s, n);
++    key.v[ki++] = std::bit_cast<uint32_t>(depth_scale);
      auto it = pipelines_.find(key);
      if (it != pipelines_.end())
          return it->second;
-@@ -1116,14 +1689,20 @@ void Vulkan::Constants(const State &s, uint32_t w, uint32_t h, const TexInfo *in
+@@ -937,7 +1629,7 @@ VkPipeline Vulkan::Pipeline(const State &s, const Assembled &a, VkRenderPass pas
+         Fail("wireframe is not implemented in development backend");
+     rs.depthBiasEnable = SS(s, kMSolidOffsetEnable) != 0;
+     rs.depthBiasConstantFactor = std::round(Bits(SS(s, kMDepthOffset)) * 16777215.0f / s.zscale);
+-    rs.depthBiasSlopeFactor = Bits(SS(s, kMSlopeScale));
++    rs.depthBiasSlopeFactor = Bits(SS(s, kMSlopeScale)) * depth_scale;
+     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+@@ -1003,7 +1695,8 @@ void Transpose(const float *a, float *b) {
+         for (int c = 0; c < 4; c++)
+             b[c * 4 + r] = a[r * 4 + c];
+ }
+-void Vulkan::Constants(const State &s, uint32_t w, uint32_t h, const TexInfo *info, DrawConstants &c) {
++void Vulkan::Constants(const State &s, uint32_t w, uint32_t h, const TexInfo *info, float target_scale,
++                       const float *wide_k, DrawConstants &c) {
+     c.surf[0] = float(w);
+     c.surf[1] = float(h);
+     c.surf[2] = 1 / s.zscale;
+@@ -1034,13 +1727,19 @@ void Vulkan::Constants(const State &s, uint32_t w, uint32_t h, const TexInfo *in
+     Color(s.rs[kRsTextureFactor], c.tfactor);
+     for (int i = 0; i < 4; i++) {
+         if (info[i].flags & kTexTarget)
+-            c.rtshift[i] = (!program || ReadsViewportOffset(s.vs->program)) ? -0.5f : 0.0f;
++            c.rtshift[i] = (!program || ReadsViewportOffset(s.vs->program)) ? -0.5f * target_scale : 0.0f;
+         const auto &t = s.tss[size_t(i)];
+         TextureDesc d;
+         if (s.textures[size_t(i)] && Describe(s.textures[size_t(i)], d)) {
+             c.texsize[i][0] = float(d.width);
+             c.texsize[i][1] = float(d.height);
+-            if (app::Get().point_nudge && t[kTssMagFilter] < 2 && t[kTssMinFilter] < 2) {
++            if (wide_k[i] > 0.0f && d.width && d.height) {
++                float n = std::ceil(3.0f * wide_k[i] * 0.5f);
++                c.spread[i][0] = 3.0f / (n * float(d.width) * wide_k[i]);
++                c.spread[i][1] = 3.0f / (n * float(d.height) * wide_k[i]);
++                c.spread[i][2] = n;
++            }
++            if (app::Get().point_nudge && t[kTssMagFilter] < 2 && t[kTssMinFilter] < 2 && d.width && d.height) {
+                 c.texsize[i][2] = 1.0f / (1024 * d.width);
+                 c.texsize[i][3] = 1.0f / (1024 * d.height);
+             }
+@@ -1116,64 +1815,122 @@ void Vulkan::Constants(const State &s, uint32_t w, uint32_t h, const TexInfo *in
  }
  
  void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t *indices) {
@@ -1751,7 +1966,10 @@ index fc93631..5f15c22 100644
      Image *rt = Target(s.rt, false);
      Image *ds = Target(s.zs, true);
      if (!rt && !ds)
-@@ -1133,37 +1712,78 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+         Fail("draw has no attachment");
+     std::array<Image *, 4> images{};
+     TexInfo info[4]{};
++    float wide_k[4]{};
      for (int i = 0; i < 4; i++) {
          images[size_t(i)] = Texture(s.textures[size_t(i)], s.palettes[size_t(i)]);
          auto *t = images[size_t(i)];
@@ -1762,6 +1980,13 @@ index fc93631..5f15c22 100644
              info[i].shadow = t->z ? 1 : 0;
 -            info[i].flags = target ? kTexTarget : 0;
 +            info[i].flags = t->is_target ? kTexTarget : 0;
++            if (!t->z && t->is_target && rt && rt != t && (t->gw > rt->gw || t->gh > rt->gh)) {
++                float k = float(t->w) / float(std::max(t->gw, 1u));
++                if (k > 1.01f) {
++                    info[i].flags |= kTexWide;
++                    wide_k[i] = k;
++                }
++            }
          }
          if (t == rt || t == ds) {
 -            auto snapshot = MakeImage(t->w, t->h, 1, 1, 1, t->format, t->z, false);
@@ -1820,7 +2045,7 @@ index fc93631..5f15c22 100644
 +            fk.light = vkey.light;
 +            fk.types = vkey.types;
 +            for (int i = 0; i < 4; i++)
-+                fk.tex[i] = vkey.tex[size_t(i)];
++                fk.tex[i] = vkey.tex[i];
 +        }
 +        VkShaderModule mod = Shader(
 +            program ? VertexProgramHlsl(s.vs->program, a.regs) : FixedVertexHlsl(a.regs, a.pretransformed, 0, fk),
@@ -1835,14 +2060,23 @@ index fc93631..5f15c22 100644
 +        VkShaderModule mod = Shader(PixelHlsl(pk), false, ps);
 +        ps_cache_.emplace(pk, std::make_pair(ps, mod));
 +    }
++    uint32_t gw = rt ? rt->gw : ds->gw, gh = rt ? rt->gh : ds->gh;
++    uint32_t hw = rt ? rt->w : ds->w, hh = rt ? rt->h : ds->h;
++    float target_scale = float(hw) / float(std::max(gw, 1u));
++    float depth_scale = ds ? float(ds->w) / float(std::max(ds->gw, 1u)) : 1.0f;
      auto pass = Pass(rt != nullptr, ds != nullptr);
-     auto pipeline = Pipeline(s, a, pass, rt != nullptr, ds != nullptr, vs, ps);
+-    auto pipeline = Pipeline(s, a, pass, rt != nullptr, ds != nullptr, vs, ps);
+-    uint32_t w = rt ? rt->w : ds->w, h = rt ? rt->h : ds->h;
++    auto pipeline = Pipeline(s, a, pass, rt != nullptr, ds != nullptr, vs, ps, depth_scale);
 +    uint64_t t_rec0 = NowNs();
 +    perf_.shd_ns += t_rec0 - t_shd0;
-     uint32_t w = rt ? rt->w : ds->w, h = rt ? rt->h : ds->h;
      DrawConstants dc{};
-     Constants(s, w, h, info, dc);
-@@ -1173,7 +1793,7 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+-    Constants(s, w, h, info, dc);
++    Constants(s, gw, gh, info, target_scale, wide_k, dc);
+     if (a.topology == Topology::Points)
+-        dc.surf[3] = 1;
++        dc.surf[3] = large_points_ ? std::min(target_scale, max_point_size_) : 1.0f;
+     VkDescriptorBufferInfo buffers[2] = {
          {arena_, Upload(s.vsc.data(), sizeof(s.vsc), size_t(alignment_)), sizeof(s.vsc)},
          {arena_, Upload(&dc, sizeof(dc), size_t(alignment_)), sizeof(dc)}};
      VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -1851,7 +2085,15 @@ index fc93631..5f15c22 100644
      ai.descriptorSetCount = 1;
      ai.pSetLayouts = &descriptors_;
      VkDescriptorSet set;
-@@ -1204,25 +1824,16 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+@@ -1197,86 +1954,134 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+         auto *t = images[size_t(i)];
+         im[i].imageView = t->sample;
+         im[i].imageLayout = t->layout;
+-        im[4 + i].sampler = Sampler(s, i, info[i].shadow != 0);
++        im[4 + i].sampler = Sampler(s, i, info[i].shadow != 0, t->levels);
+     }
+     vkUpdateDescriptorSets(device_, 10, writes, 0, nullptr);
+     auto vb = Upload(a.buffers[0].src, a.buffers[0].bytes);
      VkDeviceSize ib = 0;
      if (a.index_count)
          ib = Upload(a.index_src, size_t(a.index_count) * (a.index16 ? 2 : 4));
@@ -1859,7 +2101,9 @@ index fc93631..5f15c22 100644
 -        Layout(*rt, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 -    if (ds)
 -        Layout(*ds, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-     uint32_t fw = ds ? std::min(w, ds->w) : w, fh = ds ? std::min(h, ds->h) : h;
+-    uint32_t fw = ds ? std::min(w, ds->w) : w, fh = ds ? std::min(h, ds->h) : h;
++    uint32_t fw = ds ? std::min(hw, ds->w) : hw, fh = ds ? std::min(hh, ds->h) : hh;
++    uint32_t fgw = ds ? std::min(gw, ds->gw) : gw, fgh = ds ? std::min(gh, ds->gh) : gh;
      uint32_t q = ~0u;
 -    if (SS(s, kMCountEnable)) {
 -        q = query_next_++;
@@ -1872,22 +2116,65 @@ index fc93631..5f15c22 100644
 -    vkCmdBeginRenderPass(cmd_, &begin, VK_SUBPASS_CONTENTS_INLINE);
 -    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 -    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
+-    VkViewport viewport{0, 0, float(w), float(h), 0, 1};
+-    vkCmdSetViewport(cmd_, 0, 1, &viewport);
 +    if (SS(s, kMCountEnable))
 +        q = QueryBase() + CurrentSlot().query_next++;
 +    BeginRender(rt, ds);
 +    VkCommandBuffer cb = Cmd();
 +    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 +    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
-     VkViewport viewport{0, 0, float(w), float(h), 0, 1};
--    vkCmdSetViewport(cmd_, 0, 1, &viewport);
++    VkViewport viewport{0, 0, float(hw), float(hh), 0, 1};
 +    vkCmdSetViewport(cb, 0, 1, &viewport);
      VkRect2D sc{{0, 0}, {fw, fh}};
-     if (s.scissor_count) {
-         if (s.scissor_count > 1)
-@@ -1238,45 +1849,79 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
-     int y1 = std::min(sc.offset.y + int(sc.extent.height),
-                       int(std::min(uint64_t(s.viewport.y) + s.viewport.h, uint64_t(fh))));
-     sc = {{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
+-    if (s.scissor_count) {
+-        if (s.scissor_count > 1)
+-            Fail("multiple scissors not yet implemented");
+-        int x0 = std::clamp(int(s.scissors[0]), 0, int(fw)), y0 = std::clamp(int(s.scissors[1]), 0, int(fh));
+-        int x1 = std::clamp(int(s.scissors[2]), x0, int(fw)), y1 = std::clamp(int(s.scissors[3]), y0, int(fh));
++    if (fw == fgw && fh == fgh) {
++        if (s.scissor_count) {
++            if (s.scissor_count > 1)
++                Fail("multiple scissors not yet implemented");
++            int x0 = std::clamp(int(s.scissors[0]), 0, int(fw)), y0 = std::clamp(int(s.scissors[1]), 0, int(fh));
++            int x1 = std::clamp(int(s.scissors[2]), x0, int(fw)), y1 = std::clamp(int(s.scissors[3]), y0, int(fh));
++            sc = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
++        }
++        int x0 = std::max(sc.offset.x, int(std::min(s.viewport.x, fw))),
++            y0 = std::max(sc.offset.y, int(std::min(s.viewport.y, fh)));
++        int x1 = std::min(sc.offset.x + int(sc.extent.width),
++                          int(std::min(uint64_t(s.viewport.x) + s.viewport.w, uint64_t(fw))));
++        int y1 = std::min(sc.offset.y + int(sc.extent.height),
++                          int(std::min(uint64_t(s.viewport.y) + s.viewport.h, uint64_t(fh))));
++        sc = {{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
++    } else {
++        float sx = float(hw) / float(std::max(gw, 1u));
++        float sy = float(hh) / float(std::max(gh, 1u));
++        int x0 = int(std::lround(float(s.viewport.x) * sx));
++        int y0 = int(std::lround(float(s.viewport.y) * sy));
++        int x1 = int(std::lround(float(uint64_t(s.viewport.x) + s.viewport.w) * sx));
++        int y1 = int(std::lround(float(uint64_t(s.viewport.y) + s.viewport.h) * sy));
++        if (s.scissor_count) {
++            if (s.scissor_count > 1)
++                Fail("multiple scissors not yet implemented");
++            x0 = std::max(x0, int(std::lround(float(s.scissors[0]) * sx)));
++            y0 = std::max(y0, int(std::lround(float(s.scissors[1]) * sy)));
++            x1 = std::min(x1, int(std::lround(float(s.scissors[2]) * sx)));
++            y1 = std::min(y1, int(std::lround(float(s.scissors[3]) * sy)));
++        }
++        x0 = std::clamp(x0, 0, int(fw));
++        y0 = std::clamp(y0, 0, int(fh));
++        x1 = std::clamp(x1, x0, int(fw));
++        y1 = std::clamp(y1, y0, int(fh));
+         sc = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+     }
+-    int x0 = std::max(sc.offset.x, int(std::min(s.viewport.x, fw))),
+-        y0 = std::max(sc.offset.y, int(std::min(s.viewport.y, fh)));
+-    int x1 = std::min(sc.offset.x + int(sc.extent.width),
+-                      int(std::min(uint64_t(s.viewport.x) + s.viewport.w, uint64_t(fw))));
+-    int y1 = std::min(sc.offset.y + int(sc.extent.height),
+-                      int(std::min(uint64_t(s.viewport.y) + s.viewport.h, uint64_t(fh))));
+-    sc = {{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
 -    vkCmdSetScissor(cmd_, 0, 1, &sc);
 +    vkCmdSetScissor(cb, 0, 1, &sc);
      float blend[4];
@@ -1976,7 +2263,7 @@ index fc93631..5f15c22 100644
              rt->drawn = true;
          }
          if (ds) {
-@@ -1285,26 +1930,18 @@ void Vulkan::Clear(const State &s, uint32_t count, const uint8_t *rects, uint32_
+@@ -1285,26 +2090,18 @@ void Vulkan::Clear(const State &s, uint32_t count, const uint8_t *rects, uint32_
              VkImageAspectFlags aspects = ((flags & kClearZ) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
                                           ((flags & kClearStencil) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
              VkImageSubresourceRange r{aspects, 0, 1, 0, 1};
@@ -2007,8 +2294,26 @@ index fc93631..5f15c22 100644
      VkClearAttachment attachments[2]{};
      uint32_t n = 0;
      if (rt) {
-@@ -1327,12 +1964,13 @@ void Vulkan::Clear(const State &s, uint32_t count, const uint8_t *rects, uint32_
-         int x1 = std::clamp(r[2], x0, int(w)), y1 = std::clamp(r[3], y0, int(h));
+@@ -1320,19 +2117,29 @@ void Vulkan::Clear(const State &s, uint32_t count, const uint8_t *rects, uint32_
+         n++;
+         ds->drawn = true;
+     }
++    uint32_t gw = rt ? rt->gw : ds->gw, gh = rt ? rt->gh : ds->gh;
++    if (rt && ds) {
++        gw = std::min(gw, ds->gw);
++        gh = std::min(gh, ds->gh);
++    }
++    float sx = float(w) / float(std::max(gw, 1u));
++    float sy = float(h) / float(std::max(gh, 1u));
+     for (uint32_t i = 0; i < count; i++) {
+         int32_t r[4];
+         std::memcpy(r, rects + i * 16, 16);
+-        int x0 = std::clamp(r[0], 0, int(w)), y0 = std::clamp(r[1], 0, int(h));
+-        int x1 = std::clamp(r[2], x0, int(w)), y1 = std::clamp(r[3], y0, int(h));
++        int x0 = std::clamp(w == gw ? r[0] : int(std::lround(r[0] * sx)), 0, int(w));
++        int y0 = std::clamp(h == gh ? r[1] : int(std::lround(r[1] * sy)), 0, int(h));
++        int x1 = std::clamp(w == gw ? r[2] : int(std::lround(r[2] * sx)), x0, int(w));
++        int y1 = std::clamp(h == gh ? r[3] : int(std::lround(r[3] * sy)), y0, int(h));
          if (x1 > x0 && y1 > y0) {
              VkClearRect cr{{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, 0, 1};
 -            vkCmdClearAttachments(cmd_, n, attachments, 1, &cr);
@@ -2023,7 +2328,7 @@ index fc93631..5f15c22 100644
      LOG_FIRST(12, "vulkan: CopyRects src=%08X dst=%08X count=%u rects=%08X points=%08X", src.data, dst.data, count,
                rects, points);
      TextureDesc a, b;
-@@ -1348,10 +1986,56 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
+@@ -1348,10 +2155,62 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
          }
          if (!CopySurfaceMemory(src, dst, count, rects, points))
              Fail("unsupported CPU CopyRects format");
@@ -2045,11 +2350,13 @@ index fc93631..5f15c22 100644
 +                uint64_t ckey = uint64_t(b.data) << 1 | uint64_t(bz);
 +                auto &cached = copy_cache_[ckey];
 +                VkFormat want_fmt = bz ? depth_format_ : VK_FORMAT_B8G8R8A8_UNORM;
-+                if (!cached || cached->w != b.width || cached->h != b.height || cached->format != want_fmt ||
++                uint32_t cache_w = bz ? dt->w : b.width;
++                uint32_t cache_h = bz ? dt->h : b.height;
++                if (!cached || cached->w != cache_w || cached->h != cache_h || cached->format != want_fmt ||
 +                    cached->z != bz) {
 +                    if (cached)
 +                        CurrentSlot().retire.push_back(std::move(cached));
-+                    cached = MakeImage(b.width, b.height, 1, 1, 1, want_fmt, bz, false);
++                    cached = MakeImage(cache_w, cache_h, 1, 1, 1, want_fmt, bz, false);
 +                }
 +                if (!whole_copy || cached->signature != sig || !SameTextureDesc(cached->desc, b)) {
 +                    cached->desc = b;
@@ -2061,19 +2368,23 @@ index fc93631..5f15c22 100644
 +                    perf_.rtup++;
 +                }
 +                cached->used = frame_;
-+                Layout(*cached, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-+                Layout(*dt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-+                EndRender();
-+                uint32_t cw = std::min(cached->w, dt->w), ch = std::min(cached->h, dt->h);
-+                VkImageCopy c{};
-+                c.srcSubresource = c.dstSubresource = {
-+                    bz ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT) : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT),
-+                    0, 0, 1};
-+                c.extent = {cw, ch, 1};
-+                vkCmdCopyImage(Cmd(), cached->image, cached->layout, dt->image, dt->layout, 1, &c);
-+                if (bz) {
-+                    c.srcSubresource.aspectMask = c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++                if (!bz && (cached->w != dt->w || cached->h != dt->h)) {
++                    BlitImage(*cached, *dt, VK_FILTER_LINEAR);
++                } else {
++                    Layout(*cached, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++                    Layout(*dt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++                    EndRender();
++                    uint32_t cw = std::min(cached->w, dt->w), ch = std::min(cached->h, dt->h);
++                    VkImageCopy c{};
++                    c.srcSubresource = c.dstSubresource = {
++                        bz ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT) : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT),
++                        0, 0, 1};
++                    c.extent = {cw, ch, 1};
 +                    vkCmdCopyImage(Cmd(), cached->image, cached->layout, dt->image, dt->layout, 1, &c);
++                    if (bz) {
++                        c.srcSubresource.aspectMask = c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++                        vkCmdCopyImage(Cmd(), cached->image, cached->layout, dt->image, dt->layout, 1, &c);
++                    }
 +                }
 +                dt->signature = sig;
 +                dt->epoch = DirtyEpoch(b.data);
@@ -2084,24 +2395,114 @@ index fc93631..5f15c22 100644
          return;
      }
      Image *from = Target(src, az);
-@@ -1362,6 +2046,7 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
+@@ -1362,75 +2221,157 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
          Fail("overlapping CopyRects requires an intermediate image");
      Layout(*from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
      Layout(*to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 +    EndRender();
      uint32_t copies = count && rects ? count : 1;
-     for (uint32_t i = 0; i < copies; i++) {
-         int32_t r[4] = {0, 0, int32_t(std::min(from->w, to->w)), int32_t(std::min(from->h, to->h))}, p[2] = {0, 0};
-@@ -1382,37 +2067,40 @@ void Vulkan::Copy(const Surface &src, const Surface &dst, uint32_t count, uint32
-         c.srcOffset = {r[0], r[1], 0};
-         c.dstOffset = {p[0], p[1], 0};
-         c.extent = {uint32_t(r[2] - r[0]), uint32_t(r[3] - r[1]), 1};
--        vkCmdCopyImage(cmd_, from->image, from->layout, to->image, to->layout, 1, &c);
-+        vkCmdCopyImage(Cmd(), from->image, from->layout, to->image, to->layout, 1, &c);
-         if (az) {
-             c.srcSubresource.aspectMask = c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
--            vkCmdCopyImage(cmd_, from->image, from->layout, to->image, to->layout, 1, &c);
+-    for (uint32_t i = 0; i < copies; i++) {
+-        int32_t r[4] = {0, 0, int32_t(std::min(from->w, to->w)), int32_t(std::min(from->h, to->h))}, p[2] = {0, 0};
+-        if (count && rects) {
+-            std::memcpy(r, kernel::HostPtr(rects + i * 16), 16);
+-            p[0] = r[0];
+-            p[1] = r[1];
++    if (from->w == from->gw && from->h == from->gh && to->w == to->gw && to->h == to->gh) {
++        for (uint32_t i = 0; i < copies; i++) {
++            int32_t r[4] = {0, 0, int32_t(std::min(from->w, to->w)), int32_t(std::min(from->h, to->h))}, p[2] = {0, 0};
++            if (count && rects) {
++                std::memcpy(r, kernel::HostPtr(rects + i * 16), 16);
++                p[0] = r[0];
++                p[1] = r[1];
++            }
++            if (points)
++                std::memcpy(p, kernel::HostPtr(points + i * 8), 8);
++            if (r[0] < 0 || r[1] < 0 || p[0] < 0 || p[1] < 0 || r[2] < r[0] || r[3] < r[1] || uint32_t(r[2]) > from->w ||
++                uint32_t(r[3]) > from->h || uint32_t(p[0] + r[2] - r[0]) > to->w || uint32_t(p[1] + r[3] - r[1]) > to->h)
++                Fail("CopyRects bounds");
++            if (r[2] == r[0] || r[3] == r[1])
++                continue;
++            VkImageCopy c{};
++            c.srcSubresource = c.dstSubresource = {az ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++            c.srcOffset = {r[0], r[1], 0};
++            c.dstOffset = {p[0], p[1], 0};
++            c.extent = {uint32_t(r[2] - r[0]), uint32_t(r[3] - r[1]), 1};
 +            vkCmdCopyImage(Cmd(), from->image, from->layout, to->image, to->layout, 1, &c);
++            if (az) {
++                c.srcSubresource.aspectMask = c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++                vkCmdCopyImage(Cmd(), from->image, from->layout, to->image, to->layout, 1, &c);
++            }
+         }
+-        if (points)
+-            std::memcpy(p, kernel::HostPtr(points + i * 8), 8);
+-        if (r[0] < 0 || r[1] < 0 || p[0] < 0 || p[1] < 0 || r[2] < r[0] || r[3] < r[1] || uint32_t(r[2]) > from->w ||
+-            uint32_t(r[3]) > from->h || uint32_t(p[0] + r[2] - r[0]) > to->w || uint32_t(p[1] + r[3] - r[1]) > to->h)
+-            Fail("CopyRects bounds");
+-        if (r[2] == r[0] || r[3] == r[1])
+-            continue;
+-        VkImageCopy c{};
+-        c.srcSubresource = c.dstSubresource = {az ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+-        c.srcOffset = {r[0], r[1], 0};
+-        c.dstOffset = {p[0], p[1], 0};
+-        c.extent = {uint32_t(r[2] - r[0]), uint32_t(r[3] - r[1]), 1};
+-        vkCmdCopyImage(cmd_, from->image, from->layout, to->image, to->layout, 1, &c);
+-        if (az) {
+-            c.srcSubresource.aspectMask = c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+-            vkCmdCopyImage(cmd_, from->image, from->layout, to->image, to->layout, 1, &c);
++    } else {
++        float fsx = float(from->w) / float(std::max(from->gw, 1u));
++        float fsy = float(from->h) / float(std::max(from->gh, 1u));
++        float tsx = float(to->w) / float(std::max(to->gw, 1u));
++        float tsy = float(to->h) / float(std::max(to->gh, 1u));
++        for (uint32_t i = 0; i < copies; i++) {
++            int32_t r[4] = {0, 0, int32_t(std::min(from->gw, to->gw)), int32_t(std::min(from->gh, to->gh))}, p[2] = {0, 0};
++            if (count && rects) {
++                std::memcpy(r, kernel::HostPtr(rects + i * 16), 16);
++                p[0] = r[0];
++                p[1] = r[1];
++            }
++            if (points)
++                std::memcpy(p, kernel::HostPtr(points + i * 8), 8);
++            if (r[0] < 0 || r[1] < 0 || p[0] < 0 || p[1] < 0 || r[2] < r[0] || r[3] < r[1] ||
++                uint32_t(r[2]) > from->gw || uint32_t(r[3]) > from->gh ||
++                uint32_t(p[0] + r[2] - r[0]) > to->gw || uint32_t(p[1] + r[3] - r[1]) > to->gh)
++                Fail("CopyRects bounds");
++            if (r[2] == r[0] || r[3] == r[1])
++                continue;
++            int sx0 = std::clamp(int(std::lround(r[0] * fsx)), 0, int(from->w));
++            int sy0 = std::clamp(int(std::lround(r[1] * fsy)), 0, int(from->h));
++            int sx1 = std::clamp(int(std::lround(r[2] * fsx)), sx0, int(from->w));
++            int sy1 = std::clamp(int(std::lround(r[3] * fsy)), sy0, int(from->h));
++            int dx0 = std::clamp(int(std::lround(p[0] * tsx)), 0, int(to->w));
++            int dy0 = std::clamp(int(std::lround(p[1] * tsy)), 0, int(to->h));
++            int dx1 = std::clamp(int(std::lround((p[0] + r[2] - r[0]) * tsx)), dx0, int(to->w));
++            int dy1 = std::clamp(int(std::lround((p[1] + r[3] - r[1]) * tsy)), dy0, int(to->h));
++            if (sx1 <= sx0 || sy1 <= sy0 || dx1 <= dx0 || dy1 <= dy0)
++                continue;
++            uint32_t sw = uint32_t(sx1 - sx0), sh = uint32_t(sy1 - sy0);
++            uint32_t dw = uint32_t(dx1 - dx0), dh = uint32_t(dy1 - dy0);
++            if (!az && (sw != dw || sh != dh)) {
++                VkImageBlit blit{};
++                blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++                blit.srcOffsets[0] = {sx0, sy0, 0};
++                blit.srcOffsets[1] = {sx1, sy1, 1};
++                blit.dstOffsets[0] = {dx0, dy0, 0};
++                blit.dstOffsets[1] = {dx1, dy1, 1};
++                vkCmdBlitImage(Cmd(), from->image, from->layout, to->image, to->layout, 1, &blit, VK_FILTER_LINEAR);
++            } else {
++                uint32_t cw = std::min(sw, dw), ch = std::min(sh, dh);
++                VkImageCopy c{};
++                c.srcSubresource = c.dstSubresource = {az ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
++                                                       0, 0, 1};
++                c.srcOffset = {sx0, sy0, 0};
++                c.dstOffset = {dx0, dy0, 0};
++                c.extent = {cw, ch, 1};
++                vkCmdCopyImage(Cmd(), from->image, from->layout, to->image, to->layout, 1, &c);
++                if (az) {
++                    c.srcSubresource.aspectMask = c.dstSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++                    vkCmdCopyImage(Cmd(), from->image, from->layout, to->image, to->layout, 1, &c);
++                }
++            }
          }
      }
      to->drawn = true;
@@ -2137,12 +2538,23 @@ index fc93631..5f15c22 100644
 +    uint64_t t0 = NowNs();
      auto &t = *it->second;
      std::vector<uint8_t> px;
-     Read(t, px);
-@@ -1421,16 +2109,30 @@ void Vulkan::Sync(uint32_t data, uint32_t) {
+-    Read(t, px);
++    if (t.w == t.gw && t.h == t.gh) {
++        Read(t, px);
++    } else {
++        auto down = MakeImage(t.gw, t.gh, 1, 1, 1, VK_FORMAT_B8G8R8A8_UNORM, false, false);
++        BlitImage(t, *down, VK_FILTER_LINEAR);
++        Read(*down, px);
++        DestroyImage(*down);
++    }
+     if (Format(t.desc.format).host != Host::BGRA8 || !t.desc.linear)
+         Fail("CPU readback requires a linear 32-bit color surface");
      auto *guest = static_cast<uint8_t *>(kernel::HostPtr(data));
-     for (uint32_t y = 0; y < t.h; y++)
-         std::memcpy(guest + size_t(y) * t.desc.pitch, px.data() + size_t(y) * t.w * 4, t.w * 4);
+-    for (uint32_t y = 0; y < t.h; y++)
+-        std::memcpy(guest + size_t(y) * t.desc.pitch, px.data() + size_t(y) * t.w * 4, t.w * 4);
 -    t.signature = Hash(guest, TotalSize(t.desc));
++    for (uint32_t y = 0; y < t.gh; y++)
++        std::memcpy(guest + size_t(y) * t.desc.pitch, px.data() + size_t(y) * t.gw * 4, t.gw * 4);
 +    t.signature = MemSig(data, TotalSize(t.desc));
 +    t.epoch = DirtyEpoch(data);
      t.drawn = false;
@@ -2169,19 +2581,19 @@ index fc93631..5f15c22 100644
 +    Begin();
 +    FrameSlot &f = CurrentSlot();
 +    if (f.query_next > f.report_first) {
-+        f.events.push_back({false, 0, f.report_first, f.query_next, frame_, report_epoch_});
++        f.events.push_back({false, 0, f.report_first, f.query_next, frame_, report_epoch_, scale_ * scale_});
 +        f.report_first = f.query_next;
 +    }
 +    f.events.push_back({true, va, 0, 0, frame_, report_epoch_});
  }
  void Vulkan::SetGamma(const uint8_t *ramp) {
      std::memcpy(gamma_, ramp, 768);
-@@ -1438,17 +2140,184 @@ void Vulkan::SetGamma(const uint8_t *ramp) {
+@@ -1438,17 +2379,184 @@ void Vulkan::SetGamma(const uint8_t *ramp) {
      for (int c = 0; c < 3; c++)
          for (int i = 0; i < 256; i++)
              gamma_identity_ &= ramp[c * 256 + i] == i;
 +    gamma_dirty_ = !gamma_identity_;
- }
++}
 +bool Vulkan::EnsureGammaResources(uint32_t w, uint32_t h) {
 +    if (!gamma_sampler_) {
 +        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -2251,7 +2663,7 @@ index fc93631..5f15c22 100644
 +    float g = tex1.Sample(smp1, float2((c.g * 255.0 + 0.5) / 256.0, 0.5)).g;
 +    float b = tex1.Sample(smp1, float2((c.b * 255.0 + 0.5) / 256.0, 0.5)).b;
 +    return float4(r, g, b, 1.0);
-+}
+ }
 +)";
 +        uint64_t hvs = 0, hps = 0;
 +        gamma_vs_ = Shader(kGammaVs, true, hvs);
@@ -2341,13 +2753,14 @@ index fc93631..5f15c22 100644
      auto size = app::LinuxWindowSize();
      if (!size.width || !size.height)
          return;
+-    if (swap_ && extent_.width == size.width && extent_.height == size.height)
 +#ifdef __ANDROID__
 +    if (surface_lost_ && !RecreateSurface())
-+        return;
-+#endif
-     if (swap_ && extent_.width == size.width && extent_.height == size.height)
          return;
 -    Submit();
++#endif
++    if (swap_ && extent_.width == size.width && extent_.height == size.height && vsync_active_ == app::Get().vsync)
++        return;
 +    Drain();
      Check(vkQueueWaitIdle(queue_), "swapchain idle");
      VkSurfaceCapabilitiesKHR caps;
@@ -2363,7 +2776,7 @@ index fc93631..5f15c22 100644
      if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
          Fail("swapchain transfer destination unavailable");
      uint32_t n = 0;
-@@ -1456,36 +2325,78 @@ void Vulkan::Resize() {
+@@ -1456,36 +2564,79 @@ void Vulkan::Resize() {
      std::vector<VkSurfaceFormatKHR> formats(n);
      Check(vkGetPhysicalDeviceSurfaceFormatsKHR(physical_, surface_, &n, formats.data()), "surface formats");
      auto choice = formats.front();
@@ -2413,8 +2826,9 @@ index fc93631..5f15c22 100644
 +    std::vector<VkPresentModeKHR> modes(pm_count);
 +    if (pm_count)
 +        vkGetPhysicalDeviceSurfacePresentModesKHR(physical_, surface_, &pm_count, modes.data());
++    vsync_active_ = app::Get().vsync;
      ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-+    if (!app::Get().vsync) {
++    if (!vsync_active_) {
 +        for (auto m : modes)
 +            if (m == VK_PRESENT_MODE_MAILBOX_KHR) {
 +                ci.presentMode = m;
@@ -2447,7 +2861,7 @@ index fc93631..5f15c22 100644
      if (swap_)
          vkDestroySwapchainKHR(device_, swap_, nullptr);
      swap_ = next;
-@@ -1494,7 +2405,15 @@ void Vulkan::Resize() {
+@@ -1494,7 +2645,15 @@ void Vulkan::Resize() {
      Check(vkGetSwapchainImagesKHR(device_, swap_, &n, nullptr), "swapchain images");
      swap_images_.resize(n);
      Check(vkGetSwapchainImagesKHR(device_, swap_, &n, swap_images_.data()), "swapchain images");
@@ -2464,7 +2878,7 @@ index fc93631..5f15c22 100644
  }
  void Vulkan::Capture(Image &t) {
      auto dir = diag::CaptureDir();
-@@ -1511,6 +2430,20 @@ void Vulkan::Capture(Image &t) {
+@@ -1511,6 +2670,20 @@ void Vulkan::Capture(Image &t) {
      LOGR("vulkan: captured %s", file.c_str());
  }
  void Vulkan::Present(const Surface &front) {
@@ -2485,7 +2899,7 @@ index fc93631..5f15c22 100644
      Image *t = Target(front, false);
      if (!t)
          Fail("present has no front surface");
-@@ -1519,46 +2452,120 @@ void Vulkan::Present(const Surface &front) {
+@@ -1519,46 +2692,120 @@ void Vulkan::Present(const Surface &front) {
      Resize();
      auto size = app::LinuxWindowSize();
      if (!swap_ || !size.width || !size.height) {
@@ -2629,12 +3043,26 @@ index fc93631..5f15c22 100644
      float aspect = app::FrameAspect();
      int w = int(extent_.width), h = int(extent_.height);
      if (aspect > 0) {
-@@ -1576,23 +2583,69 @@ void Vulkan::Present(const Surface &front) {
+@@ -1569,36 +2816,115 @@ void Vulkan::Present(const Surface &front) {
+     }
+     int x = (int(extent_.width) - w) / 2, y = (int(extent_.height) - h) / 2;
+     float crop = app::Get().overscan * 0.01f;
+-    int cx = int(std::lround(source.w * crop)), cy = int(std::lround(source.h * crop));
++    int cx = std::clamp(int(std::lround(source.w * crop)), 0, int(source.w) / 4);
++    int cy = std::clamp(int(std::lround(source.h * crop)), 0, int(source.h) / 4);
+     VkImageBlit blit{};
+     blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+     blit.srcOffsets[0] = {cx, cy, 0};
      blit.srcOffsets[1] = {int(source.w) - cx, int(source.h) - cy, 1};
      blit.dstOffsets[0] = {x, y, 0};
      blit.dstOffsets[1] = {x + w, y + h, 1};
 -    vkCmdBlitImage(cmd_, source.image, source.layout, back.image, back.layout, 1, &blit, VK_FILTER_LINEAR);
-+    vkCmdBlitImage(Cmd(), source.image, source.layout, back.image, back.layout, 1, &blit, VK_FILTER_LINEAR);
++#ifdef __ANDROID__
++    VkFilter present_filter = host::NearestPresent() ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
++#else
++    VkFilter present_filter = VK_FILTER_LINEAR;
++#endif
++    vkCmdBlitImage(Cmd(), source.image, source.layout, back.image, back.layout, 1, &blit, present_filter);
      Layout(back, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 -    Submit(acquired_);
 +    Submit(false, f.acquired, swap_done_[index]);
@@ -2708,7 +3136,40 @@ index fc93631..5f15c22 100644
      for (auto it = textures_.begin(); it != textures_.end();)
          if (frame_ - it->second->used > 120) {
              DestroyImage(*it->second);
-@@ -1608,32 +2661,49 @@ Vulkan::~Vulkan() {
+             it = textures_.erase(it);
+         } else
+             ++it;
++    ApplyGraphicsSettings();
++}
++void Vulkan::ApplyGraphicsSettings() {
++#ifdef __ANDROID__
++    float want = host::RenderScale();
++#else
++    float want = 1.0f;
++#endif
++    if (std::fabs(want - scale_) <= 1e-4f)
++        return;
++    Drain();
++    Check(vkQueueWaitIdle(queue_), "scale change idle");
++    for (auto [k, v] : framebuffers_)
++        vkDestroyFramebuffer(device_, v, nullptr);
++    framebuffers_.clear();
++    for (auto &[k, v] : targets_)
++        DestroyImage(*v);
++    targets_.clear();
++    for (auto &[k, v] : copy_cache_)
++        DestroyImage(*v);
++    copy_cache_.clear();
++    if (gamma_out_) {
++        DestroyImage(*gamma_out_);
++        gamma_out_.reset();
++    }
++    scale_ = want;
++    LOGR("vulkan: render scale applied -> %.2fx", scale_);
+ }
+ Vulkan::~Vulkan() {
+     if (!device_)
+@@ -1608,32 +2934,49 @@ Vulkan::~Vulkan() {
          vkDestroyFramebuffer(device_, v, nullptr);
      for (auto [k, v] : pipelines_)
          vkDestroyPipeline(device_, v, nullptr);
@@ -2764,7 +3225,7 @@ index fc93631..5f15c22 100644
      vkDestroyDevice(device_, nullptr);
      vkDestroySurfaceKHR(instance_, surface_, nullptr);
      vkDestroyInstance(instance_, nullptr);
-@@ -1642,8 +2712,10 @@ Vulkan::~Vulkan() {
+@@ -1642,8 +2985,10 @@ Vulkan::~Vulkan() {
  std::unique_ptr<Backend> CreateBackend() {
      return std::make_unique<Vulkan>();
  }

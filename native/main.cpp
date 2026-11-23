@@ -42,6 +42,13 @@ std::mutex g_loose_lock;
 input::Pad g_loose_pad{};
 input::Pad g_touch_pad{};
 
+// Android graphics / upscale state bridged with Vulkan & Settings UI (defaults preserve v0.8.0-android.9 behavior).
+std::atomic<float> g_render_scale{1.0f};
+std::atomic<bool> g_nearest_present{false};
+std::atomic<float> g_max_aniso{1.0f};
+std::atomic<uint32_t> g_max_image_dim{4096};
+std::atomic<bool> g_settings_loaded{false};
+
 std::string Utf8(const wchar_t* w) {
     std::string s;
     for (; w && *w; w++) s += *w < 0x80 ? char(*w) : '?';
@@ -241,6 +248,71 @@ Java_com_genmarecomp_android_GenmaActivity_nativeLooseRelease(JNIEnv*, jclass) {
     g_loose_pad = {};
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_genmarecomp_android_GenmaActivity_nativeSetRenderOptions(
+    JNIEnv*, jclass, jfloat renderScale, jboolean nearestPresent) {
+    host::SetRenderScale(renderScale);
+    host::SetNearestPresent(nearestPresent == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_genmarecomp_android_GenmaActivity_nativeGetGraphicsSettings(JNIEnv* env, jclass) {
+    std::lock_guard lock(app::UiLock());
+    const app::Settings& s = app::Get();
+    const bool loaded = g_settings_loaded.load();
+    const app::Aspect aspect = loaded ? s.aspect : app::kGame.aspect;
+    const float overscan = loaded ? s.overscan : app::kGame.overscan;
+    const bool modern = (!app::kGame.options.empty() && app::kGame.options[0].flag)
+                            ? *app::kGame.options[0].flag
+                            : true;
+    jint vals[11] = {
+        jint(std::lround(host::RenderScale() * 100.0f)),
+        jint(aspect),
+        jint(s.aniso),
+        jint(s.vsync ? 1 : 0),
+        jint(s.fps_cap),
+        jint(std::lround(overscan * 100.0f)),
+        jint(s.point_nudge ? 1 : 0),
+        jint(s.precise_depth ? 1 : 0),
+        jint(host::NearestPresent() ? 1 : 0),
+        jint(modern ? 1 : 0),
+        jint(std::max(1, int(std::floor(host::MaxAniso())))),
+    };
+    jintArray out = env->NewIntArray(11);
+    if (out) env->SetIntArrayRegion(out, 0, 11, vals);
+    return out;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_genmarecomp_android_GenmaActivity_nativeApplyGraphicsSettings(
+    JNIEnv*, jclass, jint scalePct, jint aspect, jint aniso, jboolean vsync, jint fpsCap,
+    jint overscanX100, jboolean pointNudge, jboolean preciseDepth, jboolean nearestPresent,
+    jboolean modernControls) {
+    host::SetRenderScale(std::clamp(float(scalePct) / 100.0f, 0.5f, 3.0f));
+    host::SetNearestPresent(nearestPresent == JNI_TRUE);
+    {
+        std::lock_guard lock(app::UiLock());
+        app::Settings& s = app::Get();
+        s.aspect = app::Aspect(std::clamp(int(aspect), 0, 3));
+        s.aniso = uint32_t(std::clamp(int(aniso), 0, 16));
+        s.vsync = (vsync == JNI_TRUE);
+        s.fps_cap = uint32_t(std::max(0, int(fpsCap)));
+        s.overscan = std::clamp(float(overscanX100) / 100.0f, 0.0f, 15.0f);
+        s.point_nudge = (pointNudge == JNI_TRUE);
+        s.precise_depth = (preciseDepth == JNI_TRUE);
+        if (!app::kGame.options.empty() && app::kGame.options[0].flag) {
+            *app::kGame.options[0].flag = (modernControls == JNI_TRUE);
+        }
+        if (g_settings_loaded.load()) {
+            app::Save();
+        }
+        LOGR("settings: scale=%.2fx aspect=%d aniso=%u vsync=%d fps=%u overscan=%.2f%% nudge=%d pdepth=%d nearest=%d modern=%d",
+             host::RenderScale(), int(s.aspect), s.aniso, int(s.vsync), s.fps_cap, s.overscan,
+             int(s.point_nudge), int(s.precise_depth), int(host::NearestPresent()),
+             (!app::kGame.options.empty() && app::kGame.options[0].flag) ? int(*app::kGame.options[0].flag) : 1);
+    }
+}
+
 namespace host {
 
 SDL_Window* Window() { return g_window; }
@@ -256,6 +328,17 @@ void WindowPixels(int& w, int& h) {
     w = h = 0;
     if (g_window) SDL_GetWindowSizeInPixels(g_window, &w, &h);
 }
+
+float RenderScale() { return g_render_scale.load(); }
+void SetRenderScale(float scale) { g_render_scale.store(std::clamp(scale, 0.5f, 3.0f)); }
+bool NearestPresent() { return g_nearest_present.load(); }
+void SetNearestPresent(bool nearest) { g_nearest_present.store(nearest); }
+void SetGpuCaps(float max_aniso, uint32_t max_image_dim) {
+    g_max_aniso.store(std::max(1.0f, max_aniso));
+    g_max_image_dim.store(std::max(2048u, max_image_dim));
+}
+float MaxAniso() { return g_max_aniso.load(); }
+uint32_t MaxImageDim() { return g_max_image_dim.load(); }
 
 }  // namespace host
 
@@ -331,6 +414,7 @@ int main(int, char**) {
 
     logx::Init((app::ExeDir() / "logs").string(), app::kGame.log, false);
     app::Load();
+    g_settings_loaded.store(true);
     if (app::kGame.init) app::kGame.init();
     app::LogSystem();
 
