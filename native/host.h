@@ -25,5 +25,18 @@ void SetNearestPresent(bool nearest);
 void SetGpuCaps(float max_aniso, uint32_t max_image_dim);
 float MaxAniso();
 uint32_t MaxImageDim();
+// Non-stretched widescreen controls ("16:9 / Full Screen Tanpa Gepeng"):
+// FillNoStretch crops Aspect::Stretch (0) to the screen aspect at 1:1 square pixels;
+// WideVerticalPan shifts the vertical crop window [0.0=top .. 1.0=bottom] (default 0.70=subtitle-safe).
+bool FillNoStretch();
+void SetFillNoStretch(bool fill);
+float WideVerticalPan();
+void SetWideVerticalPan(float pan);
+// In-game Bahasa Indonesia localization (subtitles, dialogues, items, menus).
+bool IndonesianGame();
+void SetIndonesianGame(bool enabled);
+void OnXbeLoaded();
+std::string GameDir();
+void SetGameDir(const std::string& dir);
 
 }  // namespace host

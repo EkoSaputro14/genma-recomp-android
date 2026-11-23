@@ -19,7 +19,9 @@
   - Automatic fallback from `VK_FORMAT_D24_UNORM_S8_UINT` to `VK_FORMAT_D32_SFLOAT_S8_UINT` when a GPU driver does not support packed 24-bit depth-stencil sampling/attachments (common on ARM Mali, Immortalis, and Exynos).
   - Non-sRGB swapchain preference (`VK_FORMAT_B8G8R8A8_UNORM` -> `VK_FORMAT_R8G8B8A8_UNORM`) before falling back to driver default, avoiding washed-out double-gamma presentation.
   - CPU DXT1/DXT3/DXT5 texture decode fallback when hardware BC texture compression is unavailable (`vulkan: BC textures unavailable`).
-- **Built-in Touch Controls + Gamepad Support**: Multi-touch virtual Xbox overlay (`Stick`, `D-Pad`, `A/B/X/Y`, `LB/LT/RB/RT`, `BACK/START`, and `PAD` visibility toggle) plus SDL3 & Android OEM controller support.
+- **Built-in Touch Controls + Gamepad Support**: Multi-touch virtual Xbox overlay (`Stick`, `D-Pad`, `A/B/X/Y`, `LB/LT/RB/RT`, `BACK/START`, `PAD` visibility toggle, and interactive `CFG` drag/resize layout editor) plus SDL3 & Android OEM controller support.
+- **16:9 / Full-Screen No-Stretch ("Tanpa Gepeng") + Upscaling (`v0.8.0-android.11`)**: Keeps exact 1:1 square pixels via configurable vertical framing (`Top / Center / Subtitle-Safe / Bottom`) alongside `0.75x–3x` internal resolution upscaling, while keeping `4:3 (1x Native)` untouched as default.
+- **Bahasa Indonesia Localization (`v0.8.0-android.11`)**: Switch between **English (Default)** and **Bahasa Indonesia** for both the Android app UI and in-game text/subtitles (cutscene subtitles, room dialogues, item names/descriptions, save prompts, and choices) at runtime without modifying your `.iso`, plus layered `lang/id/` and `mods/` VFS overrides.
 
 ---
 
@@ -78,7 +80,7 @@ Porting native ARM64 berbasis static recompilation untuk game Original Xbox ***G
 
 1. **Unduh APK**: Ambil `GenmaOnimusha-v*-android-arm64-v8a.apk` dari halaman [**Releases**](https://github.com/EkoSaputro14/genma-recomp-android/releases/latest) (wajib Android 10+ ARM64 dengan Vulkan 1.1+).
 2. **Siapkan File Game Milik Pribadi**: Letakkan file `.iso` / `.xiso` atau folder berisi `default.xbe` ke `/sdcard/GenmaOnimusha/` atau `/sdcard/Android/data/com.genmarecomp.android/files/assets/` (atau pilih lewat menu import ISO di aplikasi).
-3. **Bantu Testing Multi-Device**: Rilis **`v0.8.0-android.8`** menambahkan fallback GPU `VK_FORMAT_D32_SFLOAT_S8_UINT` serta prioritas swapchain non-sRGB khusus agar GPU **MediaTek (Mali/Immortalis)** dan **Samsung Exynos** bisa berjalan.
+3. **Bantu Testing Multi-Device**: Rilis terbaru dilengkapi kontrol sentuh interaktif (`CFG`), upscaling `0.75x–3x`, mode **16:9 / Layar Penuh Tanpa Gepeng**, serta dukungan **Bahasa Indonesia (Menu APK + Subtitle & Teks Dalam Game)** lewat tombol `CFG -> Language / Bahasa`. Fallback `VK_FORMAT_D32_SFLOAT_S8_UINT` & swapchain non-sRGB tetap aktif agar GPU **MediaTek (Mali/Immortalis)** dan **Samsung Exynos** berjalan lancar.
 4. **Kirim Laporan & Log**: Ambil log dari `/sdcard/Android/data/com.genmarecomp.android/files/logs/genma.log` lalu kirim lewat template [**Device Test Report**](https://github.com/EkoSaputro14/genma-recomp-android/issues/new?template=device_test_report.yml). Jangan lupa kasih ⭐ **Star** jika proyek ini bermanfaat!
 
 ---
