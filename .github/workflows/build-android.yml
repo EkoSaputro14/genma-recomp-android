@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Tag versi rilis Android (contoh: v0.8.0-android.12)'
+        description: 'Tag versi rilis Android (contoh: v0.8.0-android.13)'
         required: true
-        default: 'v0.8.0-android.12'
+        default: 'v0.8.0-android.13'
         type: string
       publish_release:
         description: 'Publikasikan langsung ke GitHub Releases'
@@ -93,7 +93,7 @@ jobs:
           rm -f "$key_file"
           sha1sum assets/default.xbe
 
-          sudo apt-get update && sudo apt-get install -y clang make ninja-build lld
+          sudo apt-get update && sudo apt-get install -y clang make ninja-build lld python3-pil
           cmake --preset linux-core
           cmake --build --preset linux-core --target xbe_recomp xbe_symbols --parallel "$(nproc)"
           ./out/build/linux-core/xbe_recomp config/game.toml --xdk sdk/xdk
@@ -124,11 +124,16 @@ jobs:
         run: |
           VERSION="${{ inputs.release_version || github.ref_name }}"
           if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
-            VERSION="v0.8.0-android.12"
+            VERSION="v0.8.0-android.13"
           fi
           CLEAN_NAME="${VERSION#v}"
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
           echo "name=$CLEAN_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Android Launcher Icons (Adaptive + Legacy + Round)
+        run: |
+          python3 tools/generate_android_icons.py
+          ls -lh android/app/src/main/res/mipmap-xxxhdpi/ic_launcher*.png
 
       - name: Build Android ARM64 APK (SDL3 + Vulkan + libmain.so)
         working-directory: android
@@ -166,16 +171,16 @@ jobs:
           body: |
             ### Genma Onimusha — Android ARM64 Port (${{ steps.ver.outputs.tag }})
 
-            > **Catatan Pembaruan**: Rilis ini memperbaiki bug *softlock/stuck* pada mode **Bahasa Indonesia** (`v0.8.0-android.11`). Dapat langsung di-install menimpa `v0.8.0-android.9 / .10 / .11` tanpa perlu uninstall APK lama (`hasFragileUserData="true"` dan keystore rilis konsisten). Pengaturan grafis default tetap sama (`1x` Native 480p, `4:3`, V-Sync On, 60 FPS, Bilinear).
+            > **Catatan Pembaruan**: Rilis ini menambahkan translasi Bahasa Indonesia untuk seluruh dokumen bacaan in-game (*Jurnal*, *Catatan Sougen*, *Surat Yuki*, *Petunjuk*, dan *Buku*) serta ikon aplikasi APK baru (*Onimusha Genma*). Dapat langsung di-install menimpa `v0.8.0-android.9 / .10 / .11 / .12` tanpa perlu uninstall APK lama (`hasFragileUserData="true"` dan keystore rilis konsisten). Pengaturan grafis default tetap sama (`1x` Native 480p, `4:3`, V-Sync On, 60 FPS, Bilinear).
 
-            - **Perbaikan Kritis pada Rilis Ini (`v0.8.0-android.12`)**:
-              - **Perbaikan Softlock / Stuck Cutscene & Dialog Bahasa Indonesia (`native/lang_id.cpp`)**:
-                - Mempertahankan penuh **2-byte opcode `0xF0 <arg>`** (mode tunggu tombol `0x00` vs timer cutscene otomatis `0x0C–0xF0`) pada seluruh 119 file `.rdt`, 3 `.ldt`, tabel XBE (`sys_msgs`, `item_descs`, `choices`), serta *custom overrides* (`custom_id.tsv`) dan pesan yang tidak diterjemahkan.
-                - Sebelumnya pemotongan byte `<arg>` menyebabkan VM teks membaca byte pertama pesan berikutnya (`0xF4` / `0xFA`) sebagai timer `8.13` detik non-skippable hingga memicu *softlock* (mis. di `ROOM007.RDT`).
-                - Deduplikasi RDT/LDT kini membedakan payload berdasarkan `<arg>` asli agar pesan jeda dengan durasi berbeda tidak ikut bergabung.
-            - **Fitur Utama yang Tersedia (`v0.8.0-android.11+`)**:
-              - **Resolusi 16:9 & Layar Penuh Tanpa Gepeng (`CFG` -> Graphics -> Aspect Ratio)**: mode `16:9 (Tanpa Gepeng)` & `Full Screen (Tanpa Gepeng)` dengan piksel `1:1` presisi, `Posisi Vertikal 16:9`, serta Upscale `0.75x–3x`.
-              - **Translasi Bahasa Indonesia Lengkap (`CFG` -> Language / Bahasa)**: lokalisasi menu aplikasi Android & seluruh teks/subtitle in-game secara *runtime* (tanpa memodifikasi ISO) + dukungan `lang/id/` (`custom_id.tsv`).
+            - **Fitur Baru pada Rilis Ini (`v0.8.0-android.13`)**:
+              - **Translasi Bahasa Indonesia Lengkap untuk 19 Dokumen In-Game (`native/lang_id_docs_data.h` + renderer `OIM ` 4bpp *on-the-fly* di `native/lang_id.cpp`)**:
+                - Merender teks Bahasa Indonesia ber-*outline* secara *runtime* (tanpa mengubah file ISO) ke atas tekstur transparan **19 arsip dokumen**: `E_TEGAMI.LDT`, `FILE00E.LDT` (*Surat Putri Yuki*), `FILE01E/E2/E3.LDT` (*Petunjuk Tipe A/B/C*), `FILE02E.LDT` (*Catatan Sougen*), `FILE03E–08E.LDT` (*Jurnal #1–#6*), `FILE09E–0DE.LDT` (*Buku Biru #1–#5*), `FILE0EE.LDT` (*Buku Merah*), dan `FILE0FE.LDT` (*Buku Raja Iblis*), sambil membiarkan ilustrasi latar (`.bg`) dan elemen UI tetap utuh.
+                - **4 kunci sandi Ogre** (`FILE10E–13E` & `E_BUN0–3`) sengaja dipertahankan persis aslinya agar seluruh teka-teki peti kombinasi tetap 100% akurat dan dapat diselesaikan.
+              - **Ikon Aplikasi APK Baru (`Adaptive` + `Legacy` + `Round`)**: ikon *Onimusha Genma* berbingkai emas bersih tanpa sudut putih untuk Android 10–15 (`hdpi–xxxhdpi` + `mipmap-anydpi-v26`).
+            - **Perbaikan & Fitur dari Rilis Sebelumnya**:
+              - Mempertahankan penuh **2-byte opcode `0xF0 <arg>`** (`v0.8.0-android.12`) untuk mencegah *softlock* cutscene/dialog di seluruh `.rdt`/`.ldt` dan tabel XBE.
+              - Mode **16:9 / Layar Penuh Tanpa Gepeng**, **Upscale `0.75x–3x`**, serta **Touch Layout Editor** (`CFG`).
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`, 16 KB page-aligned
           files: |
             release-dist/*.apk
