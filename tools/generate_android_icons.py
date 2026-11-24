@@ -34,7 +34,8 @@ def load_master() -> Image.Image:
 def make_round_icon(master: Image.Image, size: int) -> Image.Image:
     # Fit inner art inside a dark crimson circle backing (~74% of diameter, matching inscribed
     # rounded square 1/sqrt(2)) so the metallic gold ring never clips "github/ekosaputro14".
-    inner_src = master.crop((24, 24, master.width - 24, master.height - 24))
+    rim_crop = max(1, round(master.width * (24.0 / 512.0)))
+    inner_src = master.crop((rim_crop, rim_crop, master.width - rim_crop, master.height - rim_crop))
     inset_sz = round(size * 0.74)
     inner = inner_src.resize((inset_sz, inset_sz), Image.Resampling.LANCZOS)
 
