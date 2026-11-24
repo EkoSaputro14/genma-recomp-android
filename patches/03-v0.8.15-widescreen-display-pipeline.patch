@@ -1,0 +1,362 @@
+diff --git a/sdk/runtime/app/settings.cpp b/sdk/runtime/app/settings.cpp
+index 6d21f53..a04695d 100644
+--- a/sdk/runtime/app/settings.cpp
++++ b/sdk/runtime/app/settings.cpp
+@@ -21,6 +21,9 @@
+ 
+ #include "app/app.h"
+ #include "core/log.h"
++#ifdef __ANDROID__
++#include "host.h"
++#endif
+ 
+ namespace app {
+ 
+@@ -132,6 +135,10 @@ Mode Desktop() {
+     if (GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_REGISTRY_SETTINGS, &dm))
+         return {dm.dmPelsWidth, dm.dmPelsHeight};
+     return {uint32_t(GetSystemMetrics(SM_CXSCREEN)), uint32_t(GetSystemMetrics(SM_CYSCREEN))};
++#elif defined(__ANDROID__)
++    uint32_t w = 0, h = 0;
++    host::ScreenMode(w, h);
++    return (w > 0 && h > 0) ? Mode{w, h} : Mode{1920, 1080};
+ #else
+     const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
+     return m ? Mode{uint32_t(m->w), uint32_t(m->h)} : Mode{1280, 800};
+@@ -146,6 +153,12 @@ Mode Output() {
+ 
+ bool Widescreen() {
+     const Settings& s = Get();
++#ifdef __ANDROID__
++    if (host::DisplayMode() == 1 || s.aspect == Aspect::Ratio16x9) return true;
++    if (s.aspect != Aspect::Auto) return false;
++    Mode m = Output();
++    return m.width * 2 >= m.height * 3;
++#else
+     if (s.aspect == Aspect::Ratio16x9) return true;
+     if (s.aspect != Aspect::Auto) return false;
+     // asked per frame and per HUD quad: the desktop mode lookup only runs when the resolution setting changes
+@@ -157,11 +170,20 @@ bool Widescreen() {
+         wide = m.width * 2 >= m.height * 3;  // 3:2 or wider
+     }
+     return wide;
++#endif
+ }
+ 
+ float FrameAspect() {
++#ifdef __ANDROID__
++    switch (host::DisplayMode()) {
++        case 1: return 16.0f / 9.0f;
++        case 2: return 0.0f;
++        default: return 4.0f / 3.0f;
++    }
++#else
+     if (Get().aspect == Aspect::Stretch) return 0;
+     return Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
++#endif
+ }
+ 
+ float RenderScale(uint32_t guest_height) {
+diff --git a/sdk/runtime/gpu/vulkan.cpp b/sdk/runtime/gpu/vulkan.cpp
+index abd3482..2e0a71d 100644
+--- a/sdk/runtime/gpu/vulkan.cpp
++++ b/sdk/runtime/gpu/vulkan.cpp
+@@ -28,6 +28,7 @@
+ #include "gpu/vertex.h"
+ #include "kernel/kernel.h"
+ #ifdef __ANDROID__
++#include "display_math.h"
+ #include "host.h"
+ #include "vk_shader.h"
+ #endif
+@@ -316,6 +317,11 @@ class Vulkan final : public Backend {
+ #ifdef __ANDROID__
+     uint32_t surface_epoch_ = 0;
+     bool surface_lost_ = false;
++    uint32_t last_vp_w_ = 0;
++    uint32_t last_vp_h_ = 0;
++    VkRect2D last_scissor_{};
++    uint32_t surface_recreate_count_ = 0;
++    uint64_t last_diag_sig_ = 0;
+     bool RecreateSurface();
+ #endif
+     FrameSlot &CurrentSlot() { return slots_[slot_]; }
+@@ -970,10 +976,15 @@ void Vulkan::UploadImage(Image &image, const TextureDesc &d, const uint32_t *col
+     Layout(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+ }
+ std::pair<uint32_t, uint32_t> Vulkan::ScaledExtent(uint32_t gw, uint32_t gh) const {
++#ifdef __ANDROID__
++    const auto ext = display_math::ComputeScaledExtent(gw, gh, scale_, max_image_dim_);
++    return {ext.width, ext.height};
++#else
+     if (std::fabs(scale_ - 1.0f) <= 1e-4f)
+         return {gw, gh};
+     return {std::clamp(uint32_t(std::lround(gw * scale_)), 1u, max_image_dim_),
+             std::clamp(uint32_t(std::lround(gh * scale_)), 1u, max_image_dim_)};
++#endif
+ }
+ void Vulkan::BlitImage(Image &src, Image &dst, VkFilter filter) {
+     Layout(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+@@ -2010,6 +2021,11 @@ void Vulkan::Draw(const State &s, uint32_t prim, uint32_t start, uint32_t count,
+         sc = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+     }
+     vkCmdSetScissor(cb, 0, 1, &sc);
++#ifdef __ANDROID__
++    last_vp_w_ = hw;
++    last_vp_h_ = hh;
++    last_scissor_ = sc;
++#endif
+     float blend[4];
+     Color(SS(s, kMBlendColor), blend);
+     vkCmdSetBlendConstants(cb, blend);
+@@ -2503,6 +2519,7 @@ float4 main(GammaVOut i) : SV_Target {
+ }
+ #ifdef __ANDROID__
+ bool Vulkan::RecreateSurface() {
++    const bool was_lost = surface_lost_;
+     Drain();
+     Check(vkQueueWaitIdle(queue_), "surface recreate idle");
+     for (VkSemaphore s : swap_done_)
+@@ -2532,31 +2549,59 @@ bool Vulkan::RecreateSurface() {
+     extent_ = {};
+     surface_epoch_ = host::SurfaceEpoch();
+     surface_lost_ = false;
+-    LOGR("vulkan: surface recreated (epoch=%u)", surface_epoch_);
++    surface_recreate_count_++;
++    last_diag_sig_ = 0;
++    LOGR("[VULKAN] surface_recreate count=%u epoch=%u reason=%s", surface_recreate_count_, surface_epoch_,
++         was_lost ? "surface_lost" : "epoch_changed");
+     return true;
+ }
+ #endif
+ void Vulkan::Resize() {
+-    auto size = app::LinuxWindowSize();
+-    if (!size.width || !size.height)
+-        return;
+ #ifdef __ANDROID__
+     if (surface_lost_ && !RecreateSurface())
+         return;
+-#endif
+-    if (swap_ && extent_.width == size.width && extent_.height == size.height && vsync_active_ == app::Get().vsync)
++    int win_w = 0, win_h = 0;
++    host::WindowPixels(win_w, win_h);
++    if (swap_ && win_w > 0 && win_h > 0 && extent_.width == uint32_t(win_w) &&
++        extent_.height == uint32_t(win_h) && vsync_active_ == app::Get().vsync)
+         return;
+-    Drain();
+-    Check(vkQueueWaitIdle(queue_), "swapchain idle");
+     VkSurfaceCapabilitiesKHR caps;
+     VkResult cap_res = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_, surface_, &caps);
+-#ifdef __ANDROID__
+     if (cap_res == VK_ERROR_SURFACE_LOST_KHR) {
+         surface_lost_ = true;
+         return;
+     }
+-#endif
+     Check(cap_res, "surface capabilities");
++    uint32_t desired_w = win_w > 0 ? uint32_t(win_w) : 0u;
++    uint32_t desired_h = win_h > 0 ? uint32_t(win_h) : 0u;
++    if ((!desired_w || !desired_h) && caps.currentExtent.width != 0xffffffffu) {
++        desired_w = caps.currentExtent.width;
++        desired_h = caps.currentExtent.height;
++    }
++    if (!desired_w || !desired_h)
++        return;
++    const uint32_t min_w = caps.minImageExtent.width;
++    const uint32_t max_w = std::max(min_w, caps.maxImageExtent.width);
++    const uint32_t min_h = caps.minImageExtent.height;
++    const uint32_t max_h = std::max(min_h, caps.maxImageExtent.height);
++    desired_w = std::clamp(desired_w, min_w, max_w);
++    desired_h = std::clamp(desired_h, min_h, max_h);
++    if (swap_ && extent_.width == desired_w && extent_.height == desired_h && vsync_active_ == app::Get().vsync)
++        return;
++    Drain();
++    Check(vkQueueWaitIdle(queue_), "swapchain idle");
++#else
++    auto size = app::LinuxWindowSize();
++    if (!size.width || !size.height)
++        return;
++    if (swap_ && extent_.width == size.width && extent_.height == size.height && vsync_active_ == app::Get().vsync)
++        return;
++    Drain();
++    Check(vkQueueWaitIdle(queue_), "swapchain idle");
++    VkSurfaceCapabilitiesKHR caps;
++    VkResult cap_res = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_, surface_, &caps);
++    Check(cap_res, "surface capabilities");
++#endif
+     if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+         Fail("swapchain transfer destination unavailable");
+     uint32_t n = 0;
+@@ -2585,8 +2630,7 @@ void Vulkan::Resize() {
+     ci.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+                           ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+                           : caps.currentTransform;
+-    ci.imageExtent = VkExtent2D{std::clamp(size.width, caps.minImageExtent.width, caps.maxImageExtent.width),
+-                                std::clamp(size.height, caps.minImageExtent.height, caps.maxImageExtent.height)};
++    ci.imageExtent = VkExtent2D{desired_w, desired_h};
+ #else
+     ci.preTransform = caps.currentTransform;
+     ci.imageExtent = caps.currentExtent.width != 0xffffffffu
+@@ -2651,9 +2695,17 @@ void Vulkan::Resize() {
+         Check(vkCreateSemaphore(device_, &sci, nullptr, &swap_done_[i]), "present semaphore");
+     VkFormatProperties sfp{};
+     vkGetPhysicalDeviceFormatProperties(physical_, swap_format_, &sfp);
++#ifdef __ANDROID__
++    last_diag_sig_ = 0;
++    LOGR("[VULKAN] swapchain_created extent=%ux%u win_px=%dx%d caps_cur=%ux%u fmt=%d blit_dst=%d preTransform=0x%X curTransform=0x%X vsync=%d",
++         extent_.width, extent_.height, win_w, win_h, caps.currentExtent.width, caps.currentExtent.height,
++         int(swap_format_), int((sfp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0),
++         unsigned(ci.preTransform), unsigned(caps.currentTransform), int(vsync_active_));
++#else
+     LOGR("vulkan: swapchain %ux%u (fmt=%d, blit_dst=%d, transform=0x%X, current=0x%X)", extent_.width, extent_.height,
+          int(swap_format_), int((sfp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0),
+          unsigned(ci.preTransform), unsigned(caps.currentTransform));
++#endif
+ }
+ void Vulkan::Capture(Image &t) {
+     auto dir = diag::CaptureDir();
+@@ -2690,12 +2742,20 @@ void Vulkan::Present(const Surface &front) {
+     if (g_capture.exchange(false) || frame_ == 0 || frame_ == 120 || frame_ == 600 || frame_ == 1800 || frame_ == 3000)
+         Capture(*t);
+     Resize();
++#ifdef __ANDROID__
++    if (!swap_ || !extent_.width || !extent_.height) {
++        Submit(true);
++        perf_.present_ns += NowNs() - t_pres0;
++        return;
++    }
++#else
+     auto size = app::LinuxWindowSize();
+     if (!swap_ || !size.width || !size.height) {
+         Submit(true);
+         perf_.present_ns += NowNs() - t_pres0;
+         return;
+     }
++#endif
+     if (!gamma_identity_) {
+         EnsureGammaResources(t->w, t->h);
+         Layout(*t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+@@ -2744,9 +2804,19 @@ void Vulkan::Present(const Surface &front) {
+     EndRender();
+     FrameSlot &f = CurrentSlot();
+     uint32_t index = 0;
+-    VkResult result = vkAcquireNextImageKHR(device_, swap_, 30000000000ull, f.acquired, VK_NULL_HANDLE, &index);
++#ifdef __ANDROID__
++    constexpr uint64_t kAcquireTimeoutNs = 500000000ull;
++#else
++    constexpr uint64_t kAcquireTimeoutNs = 30000000000ull;
++#endif
++    VkResult result = vkAcquireNextImageKHR(device_, swap_, kAcquireTimeoutNs, f.acquired, VK_NULL_HANDLE, &index);
+     VkResult acq_res = result;
+ #ifdef __ANDROID__
++    if (result == VK_TIMEOUT || result == VK_NOT_READY) {
++        Submit(true);
++        perf_.present_ns += NowNs() - t_pres0;
++        return;
++    }
+     if (result == VK_ERROR_SURFACE_LOST_KHR) {
+         static int acq_lost_logs = 0;
+         if (acq_lost_logs < 8) {
+@@ -2755,6 +2825,7 @@ void Vulkan::Present(const Surface &front) {
+         }
+         surface_lost_ = true;
+         Submit(true);
++        perf_.present_ns += NowNs() - t_pres0;
+         return;
+     }
+ #endif
+@@ -2767,6 +2838,7 @@ void Vulkan::Present(const Surface &front) {
+         Submit(true);
+         extent_ = {};
+         Resize();
++        perf_.present_ns += NowNs() - t_pres0;
+         return;
+     }
+     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+@@ -2806,6 +2878,51 @@ void Vulkan::Present(const Surface &front) {
+         vkCmdPipelineBarrier(Cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                              nullptr, 1, &waw_bar);
+     }
++#ifdef __ANDROID__
++    const auto dmode = static_cast<display_math::DisplayMode>(std::min(host::DisplayMode(), 2u));
++    const float pan = host::WideVerticalPan();
++    const auto plan = display_math::ComputePresentPlan(
++        source.w, source.h, extent_.width, extent_.height, dmode, app::Get().overscan, pan);
++    VkImageBlit blit{};
++    blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++    blit.srcOffsets[0] = {plan.sx0, plan.sy0, 0};
++    blit.srcOffsets[1] = {plan.sx1, plan.sy1, 1};
++    blit.dstOffsets[0] = {plan.dx0, plan.dy0, 0};
++    blit.dstOffsets[1] = {plan.dx1, plan.dy1, 1};
++    VkFilter present_filter = host::NearestPresent() ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
++    uint64_t diag_sig = (uint64_t(extent_.width) << 48) ^ (uint64_t(extent_.height) << 32) ^
++                        (uint64_t(source.w) << 18) ^ (uint64_t(source.h) << 4) ^ uint64_t(dmode);
++    diag_sig ^= (uint64_t(uint32_t(std::lround(pan * 100.0f))) << 24) ^
++                (uint64_t(uint32_t(std::lround(scale_ * 100.0f))) << 10) ^
++                (uint64_t(last_vp_w_) << 40) ^ (uint64_t(last_vp_h_) << 12) ^
++                (uint64_t(last_scissor_.extent.width) << 28) ^ uint64_t(last_scissor_.extent.height) ^
++                uint64_t(surface_recreate_count_);
++    if (diag_sig == 0) diag_sig = 1;
++    if (last_diag_sig_ != diag_sig) {
++        last_diag_sig_ = diag_sig;
++        int pw = 0, ph = 0;
++        float density = 1.0f;
++        host::PhysicalDisplay(pw, ph, density);
++        int ww = 0, wh = 0;
++        host::WindowPixels(ww, wh);
++        uint32_t ow = 0, oh = 0;
++        host::ScreenMode(ow, oh);
++        const float dasp = (oh > 0) ? (float(ow) / float(oh)) : (float(extent_.width) / float(std::max(1u, extent_.height)));
++        const uint32_t vp_w = last_vp_w_ ? last_vp_w_ : t->w;
++        const uint32_t vp_h = last_vp_h_ ? last_vp_h_ : t->h;
++        const uint32_t sc_w = last_scissor_.extent.width ? last_scissor_.extent.width : vp_w;
++        const uint32_t sc_h = last_scissor_.extent.height ? last_scissor_.extent.height : vp_h;
++        LOGR("[DISPLAY] physical=%dx%d (density=%.2f) sdl_window=%dx%d output=%ux%u display_aspect=%.4f mode=%s",
++             pw, ph, density, ww, wh, ow, oh, dasp, display_math::DisplayModeName(dmode));
++        LOGR("[RENDER] internal_guest=%ux%u render_target=%ux%u render_scale=%.2fx game_aspect=%.4f output_aspect=%.4f framing=%s (pan=%.2f, vcrop=%.1f%%)",
++             t->gw, t->gh, source.w, source.h, scale_, plan.src_active_aspect, plan.dst_aspect,
++             display_math::FramingName(pan), pan, plan.vertical_crop_pct);
++        LOGR("[VULKAN] swapchain=%ux%u viewport=%ux%u scissor=(%d,%d %ux%u) src_blit=(%d,%d)-(%d,%d) dst_blit=(%d,%d)-(%d,%d) scale_xy=(%.4f,%.4f) distortion=%.4f surface_recreates=%u",
++             extent_.width, extent_.height, vp_w, vp_h, last_scissor_.offset.x, last_scissor_.offset.y, sc_w, sc_h,
++             plan.sx0, plan.sy0, plan.sx1, plan.sy1, plan.dx0, plan.dy0, plan.dx1, plan.dy1,
++             plan.scale_x, plan.scale_y, plan.distortion_ratio, surface_recreate_count_);
++    }
++#else
+     float aspect = app::FrameAspect();
+     int w = int(extent_.width), h = int(extent_.height);
+     if (aspect > 0) {
+@@ -2820,34 +2937,12 @@ void Vulkan::Present(const Surface &front) {
+     int cy = std::clamp(int(std::lround(source.h * crop)), 0, int(source.h) / 4);
+     int sx0 = cx, sx1 = int(source.w) - cx;
+     int sy0 = cy, sy1 = int(source.h) - cy;
+-#ifdef __ANDROID__
+-    // Only perform vertical zoom-crop when the user explicitly opts into Zoom-Crop mode
+-    // (FillNoStretch). Standard 16:9 Widescreen and Full Screen Fill present 100% of the
+-    // 640x480 frame with zero cut-off HUD, journals, or gameplay area.
+-    const bool zoom_crop_wide = host::FillNoStretch() && (aspect == 0.0f || app::Widescreen());
+-    if (zoom_crop_wide && w > 0 && h > 0) {
+-        const int sw = sx1 - sx0;
+-        const int sh = sy1 - sy0;
+-        const float dst_aspect = float(w) / float(h);
+-        const float src_aspect = (sh > 0) ? float(sw) / float(sh) : (4.0f / 3.0f);
+-        if (dst_aspect > src_aspect + 0.01f) {
+-            const int vis_h = std::clamp(int(std::lround(float(sw) / dst_aspect)), 1, sh);
+-            const int slack = sh - vis_h;
+-            const float pan = std::clamp(host::WideVerticalPan(), 0.0f, 1.0f);
+-            sy0 += int(std::lround(float(slack) * pan));
+-            sy1 = sy0 + vis_h;
+-        }
+-    }
+-#endif
+     VkImageBlit blit{};
+     blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+     blit.srcOffsets[0] = {sx0, sy0, 0};
+     blit.srcOffsets[1] = {sx1, sy1, 1};
+     blit.dstOffsets[0] = {x, y, 0};
+     blit.dstOffsets[1] = {x + w, y + h, 1};
+-#ifdef __ANDROID__
+-    VkFilter present_filter = host::NearestPresent() ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+-#else
+     VkFilter present_filter = VK_FILTER_LINEAR;
+ #endif
+     vkCmdBlitImage(Cmd(), source.image, source.layout, back.image, back.layout, 1, &blit, present_filter);

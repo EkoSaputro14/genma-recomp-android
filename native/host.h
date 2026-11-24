@@ -1,6 +1,7 @@
 #pragma once
 // Shared Android host interface: SDL3 window, app foreground/surface lifecycle, and OEM loose controller bridge.
 #include <cstdint>
+#include <string>
 
 struct SDL_Window;
 
@@ -15,6 +16,10 @@ uint32_t SurfaceEpoch();
 void WaitForeground();
 // Current drawable surface dimensions in physical pixels.
 void WindowPixels(int& w, int& h);
+// Physical landscape display dimensions and pixel density detected from SDL3 display mode.
+void PhysicalDisplay(int& w, int& h, float& density);
+// Landscape output resolution: live window pixels if available, else physical display pixels (Black-Android ScreenMode pattern).
+void ScreenMode(uint32_t& w, uint32_t& h);
 // Internal resolution multiplier relative to guest surface size (default 1.0f = 1x native 480p).
 float RenderScale();
 void SetRenderScale(float scale);
@@ -25,11 +30,13 @@ void SetNearestPresent(bool nearest);
 void SetGpuCaps(float max_aniso, uint32_t max_image_dim);
 float MaxAniso();
 uint32_t MaxImageDim();
-// Non-stretched widescreen controls ("16:9 / Full Screen Tanpa Gepeng"):
-// FillNoStretch crops Aspect::Stretch (0) to the screen aspect at 1:1 square pixels;
-// WideVerticalPan shifts the vertical crop window [0.0=top .. 1.0=bottom] (default 0.70=subtitle-safe).
+// Display presentation strategy (0 = Native 4:3, 1 = 16:9 Widescreen No-Stretch, 2 = Fullscreen No-Stretch Adaptive).
+uint32_t DisplayMode();
+void SetDisplayMode(uint32_t mode);
+// Backward-compatible helpers; FillNoStretch() is true for DisplayMode() != 0.
 bool FillNoStretch();
 void SetFillNoStretch(bool fill);
+// Vertical framing position [0.0 = Top, 0.25 = HUD-Safe, 0.50 = Center, 0.70 = Subtitle-Safe, 1.0 = Bottom].
 float WideVerticalPan();
 void SetWideVerticalPan(float pan);
 // In-game Bahasa Indonesia localization (subtitles, dialogues, items, menus).

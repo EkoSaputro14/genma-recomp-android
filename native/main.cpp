@@ -22,6 +22,7 @@
 #include "core/input.h"
 #include "core/log.h"
 #include "core/touch_overlay.h"
+#include "display_math.h"
 #include "gpu/backend.h"
 #include "host.h"
 #include "image_symbols.h"
@@ -33,7 +34,7 @@ namespace {
 SDL_Window* g_window = nullptr;
 std::atomic<bool> g_foreground{true};
 std::atomic<uint32_t> g_surface_epoch{0};
-std::atomic<uint64_t> g_size{uint64_t(1280) << 32 | 720};
+std::atomic<uint64_t> g_size{0};
 std::mutex g_foreground_lock;
 std::condition_variable g_foreground_cv;
 std::recursive_mutex g_ui_lock;
@@ -44,18 +45,68 @@ input::Pad g_loose_pad{};
 input::Pad g_touch_pad{};
 
 // Android graphics / upscale & localization state bridged with Vulkan, VFS, & Settings UI
-// (defaults preserve v0.8.0-android.9/10 behavior).
+// (defaults preserve v0.8.0 baseline: 1x 480p, Native 4:3, V-Sync On, Bilinear).
 std::atomic<float> g_render_scale{1.0f};
 std::atomic<bool> g_nearest_present{false};
 std::atomic<float> g_max_aniso{1.0f};
 std::atomic<uint32_t> g_max_image_dim{4096};
 std::atomic<bool> g_settings_loaded{false};
+std::atomic<uint32_t> g_display_mode{0};
+std::atomic<bool> g_display_mode_explicit{false};
 std::atomic<bool> g_fill_no_stretch{false};
 std::atomic<float> g_wide_vertical_pan{0.70f};
 std::atomic<bool> g_indonesian_game{false};
 std::atomic<bool> g_gamepad_refresh_requested{false};
+std::atomic<uint64_t> g_last_logged_display_sig{0};
 std::mutex g_game_dir_lock;
 std::string g_game_dir;
+
+app::Aspect DisplayModeToAspect(uint32_t mode) {
+    switch (mode) {
+        case 1: return app::Aspect::Ratio16x9;
+        case 2: return app::Aspect::Stretch;
+        default: return app::Aspect::Ratio4x3;
+    }
+}
+
+uint32_t AspectToDisplayMode(app::Aspect aspect) {
+    switch (aspect) {
+        case app::Aspect::Ratio16x9: return 1;
+        case app::Aspect::Stretch: return 2;
+        default: return 0;
+    }
+}
+
+void DetectPhysicalDisplay(int& pw, int& ph, float& density) {
+    const SDL_DisplayID id = g_window ? SDL_GetDisplayForWindow(g_window) : SDL_GetPrimaryDisplay();
+    const SDL_DisplayMode* m = SDL_GetCurrentDisplayMode(id);
+    if (!m) m = SDL_GetDesktopDisplayMode(id);
+    density = (m && m->pixel_density > 0.0f) ? m->pixel_density : 1.0f;
+    const int raw_w = m ? std::max(1, int(std::lround(float(m->w) * density))) : 1920;
+    const int raw_h = m ? std::max(1, int(std::lround(float(m->h) * density))) : 1080;
+    const auto land = display_math::NormalizeLandscape(uint32_t(raw_w), uint32_t(raw_h));
+    pw = int(land.width);
+    ph = int(land.height);
+}
+
+void LogDisplayState(bool force) {
+    int pw = 0, ph = 0;
+    float density = 1.0f;
+    DetectPhysicalDisplay(pw, ph, density);
+    int ww = 0, wh = 0;
+    if (g_window) SDL_GetWindowSizeInPixels(g_window, &ww, &wh);
+    uint32_t ow = 0, oh = 0;
+    host::ScreenMode(ow, oh);
+    const uint32_t mode = host::DisplayMode();
+    const uint64_t sig = (uint64_t(uint32_t(pw)) << 48) ^ (uint64_t(uint32_t(ph)) << 32) ^
+                         (uint64_t(uint32_t(ww)) << 18) ^ (uint64_t(uint32_t(wh)) << 4) ^ mode;
+    if (!force && g_last_logged_display_sig.load() == sig) return;
+    g_last_logged_display_sig.store(sig);
+    const float dasp = (oh > 0) ? (float(ow) / float(oh)) : (float(pw) / float(std::max(1, ph)));
+    const auto dmode = static_cast<display_math::DisplayMode>(std::min(mode, 2u));
+    LOGR("[DISPLAY] physical=%dx%d (density=%.2f) sdl_window=%dx%d output=%ux%u display_aspect=%.4f mode=%s",
+         pw, ph, density, ww, wh, ow, oh, dasp, display_math::DisplayModeName(dmode));
+}
 
 std::string Utf8(const wchar_t* w) {
     std::string s;
@@ -99,7 +150,18 @@ void RefreshWindowSize() {
     if (!g_window) return;
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(g_window, &w, &h);
-    if (w > 0 && h > 0) g_size = (uint64_t(uint32_t(w)) << 32) | uint32_t(h);
+    if (w <= 0 || h <= 0) return;
+    if (w < h) {
+        static std::atomic<bool> logged_portrait{false};
+        if (!logged_portrait.exchange(true)) {
+            LOGI("[DISPLAY] ignoring transient portrait window %dx%d while waiting for landscape", w, h);
+        }
+        return;
+    }
+    const uint64_t next = (uint64_t(uint32_t(w)) << 32) | uint32_t(h);
+    if (g_size.exchange(next) != next) {
+        LogDisplayState(false);
+    }
 }
 
 void SyncTouchAndLoosePad() {
@@ -283,9 +345,31 @@ Java_com_genmarecomp_android_GenmaActivity_nativeSetRenderOptions(
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_genmarecomp_android_GenmaActivity_nativeSetDisplayMode(
+    JNIEnv*, jclass, jint displayMode, jfloat widePan) {
+    const uint32_t clampedMode = uint32_t(std::clamp(int(displayMode), 0, 2));
+    g_display_mode_explicit.store(true);
+    host::SetDisplayMode(clampedMode);
+    host::SetWideVerticalPan(widePan);
+    {
+        std::lock_guard lock(app::UiLock());
+        app::Get().aspect = DisplayModeToAspect(clampedMode);
+        if (g_settings_loaded.load()) {
+            app::Save();
+        }
+    }
+    LogDisplayState(true);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_genmarecomp_android_GenmaActivity_nativeSetExtendedOptions(
     JNIEnv*, jclass, jboolean fillNoStretch, jfloat widePan, jboolean indonesianGame) {
-    host::SetFillNoStretch(fillNoStretch == JNI_TRUE);
+    const bool wantFill = (fillNoStretch == JNI_TRUE);
+    if (!wantFill) {
+        host::SetDisplayMode(0);
+    } else if (host::DisplayMode() == 0) {
+        host::SetDisplayMode(2);
+    }
     host::SetWideVerticalPan(widePan);
     const bool id = (indonesianGame == JNI_TRUE);
     host::SetIndonesianGame(id);
@@ -297,12 +381,13 @@ Java_com_genmarecomp_android_GenmaActivity_nativeGetGraphicsSettings(JNIEnv* env
     std::lock_guard lock(app::UiLock());
     const app::Settings& s = app::Get();
     const bool loaded = g_settings_loaded.load();
-    const app::Aspect aspect = loaded ? s.aspect : app::kGame.aspect;
+    const uint32_t mode = host::DisplayMode();
+    const app::Aspect aspect = loaded ? s.aspect : DisplayModeToAspect(mode);
     const float overscan = loaded ? s.overscan : app::kGame.overscan;
     const bool modern = (!app::kGame.options.empty() && app::kGame.options[0].flag)
                             ? *app::kGame.options[0].flag
                             : true;
-    jint vals[14] = {
+    jint vals[15] = {
         jint(std::lround(host::RenderScale() * 100.0f)),
         jint(aspect),
         jint(s.aniso),
@@ -317,9 +402,10 @@ Java_com_genmarecomp_android_GenmaActivity_nativeGetGraphicsSettings(JNIEnv* env
         jint(host::FillNoStretch() ? 1 : 0),
         jint(std::lround(host::WideVerticalPan() * 100.0f)),
         jint(host::IndonesianGame() ? 1 : 0),
+        jint(mode),
     };
-    jintArray out = env->NewIntArray(14);
-    if (out) env->SetIntArrayRegion(out, 0, 14, vals);
+    jintArray out = env->NewIntArray(15);
+    if (out) env->SetIntArrayRegion(out, 0, 15, vals);
     return out;
 }
 
@@ -330,7 +416,12 @@ Java_com_genmarecomp_android_GenmaActivity_nativeApplyGraphicsSettings(
     jboolean modernControls, jboolean fillNoStretch, jint widePanPct, jboolean indonesianGame) {
     host::SetRenderScale(std::clamp(float(scalePct) / 100.0f, 0.5f, 3.0f));
     host::SetNearestPresent(nearestPresent == JNI_TRUE);
-    host::SetFillNoStretch(fillNoStretch == JNI_TRUE);
+    uint32_t resolvedMode = 0;
+    if (aspect == 2) resolvedMode = 1;
+    else if (aspect == 3) resolvedMode = 2;
+    else if (aspect == 0 && fillNoStretch == JNI_TRUE) resolvedMode = 1;
+    g_display_mode_explicit.store(true);
+    host::SetDisplayMode(resolvedMode);
     host::SetWideVerticalPan(float(std::clamp(int(widePanPct), 0, 100)) / 100.0f);
     const bool id = (indonesianGame == JNI_TRUE);
     host::SetIndonesianGame(id);
@@ -338,7 +429,7 @@ Java_com_genmarecomp_android_GenmaActivity_nativeApplyGraphicsSettings(
     {
         std::lock_guard lock(app::UiLock());
         app::Settings& s = app::Get();
-        s.aspect = app::Aspect(std::clamp(int(aspect), 0, 3));
+        s.aspect = DisplayModeToAspect(resolvedMode);
         s.aniso = uint32_t(std::clamp(int(aniso), 0, 16));
         s.vsync = (vsync == JNI_TRUE);
         s.fps_cap = uint32_t(std::max(0, int(fpsCap)));
@@ -351,13 +442,16 @@ Java_com_genmarecomp_android_GenmaActivity_nativeApplyGraphicsSettings(
         if (g_settings_loaded.load()) {
             app::Save();
         }
-        LOGR("settings: scale=%.2fx aspect=%d fillNoStretch=%d pan=%.2f aniso=%u vsync=%d fps=%u overscan=%.2f%% nudge=%d pdepth=%d nearest=%d modern=%d lang_id=%d",
-             host::RenderScale(), int(s.aspect), int(host::FillNoStretch()), host::WideVerticalPan(),
+        LOGR("settings: scale=%.2fx display_mode=%u (%s) aspect=%d fillNoStretch=%d pan=%.2f aniso=%u vsync=%d fps=%u overscan=%.2f%% nudge=%d pdepth=%d nearest=%d modern=%d lang_id=%d",
+             host::RenderScale(), resolvedMode,
+             display_math::DisplayModeName(static_cast<display_math::DisplayMode>(resolvedMode)),
+             int(s.aspect), int(host::FillNoStretch()), host::WideVerticalPan(),
              s.aniso, int(s.vsync), s.fps_cap, s.overscan, int(s.point_nudge), int(s.precise_depth),
              int(host::NearestPresent()),
              (!app::kGame.options.empty() && app::kGame.options[0].flag) ? int(*app::kGame.options[0].flag) : 1,
              int(host::IndonesianGame()));
     }
+    LogDisplayState(true);
 }
 
 namespace host {
@@ -376,6 +470,27 @@ void WindowPixels(int& w, int& h) {
     if (g_window) SDL_GetWindowSizeInPixels(g_window, &w, &h);
 }
 
+void PhysicalDisplay(int& w, int& h, float& density) {
+    DetectPhysicalDisplay(w, h, density);
+}
+
+void ScreenMode(uint32_t& w, uint32_t& h) {
+    if (g_window) {
+        int ww = 0, wh = 0;
+        WindowPixels(ww, wh);
+        if (ww >= wh && wh > 0) {
+            w = uint32_t(ww);
+            h = uint32_t(wh);
+            return;
+        }
+    }
+    int pw = 0, ph = 0;
+    float density = 1.0f;
+    DetectPhysicalDisplay(pw, ph, density);
+    w = uint32_t(std::max(1, pw));
+    h = uint32_t(std::max(1, ph));
+}
+
 float RenderScale() { return g_render_scale.load(); }
 void SetRenderScale(float scale) { g_render_scale.store(std::clamp(scale, 0.5f, 3.0f)); }
 bool NearestPresent() { return g_nearest_present.load(); }
@@ -386,8 +501,20 @@ void SetGpuCaps(float max_aniso, uint32_t max_image_dim) {
 }
 float MaxAniso() { return g_max_aniso.load(); }
 uint32_t MaxImageDim() { return g_max_image_dim.load(); }
-bool FillNoStretch() { return g_fill_no_stretch.load(); }
-void SetFillNoStretch(bool fill) { g_fill_no_stretch.store(fill); }
+uint32_t DisplayMode() { return g_display_mode.load(); }
+void SetDisplayMode(uint32_t mode) {
+    const uint32_t m = std::min(mode, 2u);
+    g_display_mode.store(m);
+    g_fill_no_stretch.store(m != 0);
+}
+bool FillNoStretch() { return g_display_mode.load() != 0; }
+void SetFillNoStretch(bool fill) {
+    if (!fill) {
+        SetDisplayMode(0);
+    } else if (g_display_mode.load() == 0) {
+        SetDisplayMode(2);
+    }
+}
 float WideVerticalPan() { return g_wide_vertical_pan.load(); }
 void SetWideVerticalPan(float pan) { g_wide_vertical_pan.store(std::clamp(pan, 0.0f, 1.0f)); }
 bool IndonesianGame() { return g_indonesian_game.load(); }
@@ -477,6 +604,14 @@ int main(int, char**) {
 
     logx::Init((app::ExeDir() / "logs").string(), app::kGame.log, false);
     app::Load();
+    {
+        std::lock_guard lock(app::UiLock());
+        if (g_display_mode_explicit.load()) {
+            app::Get().aspect = DisplayModeToAspect(host::DisplayMode());
+        } else {
+            host::SetDisplayMode(AspectToDisplayMode(app::Get().aspect));
+        }
+    }
     g_settings_loaded.store(true);
     if (app::kGame.init) app::kGame.init();
     app::LogSystem();
@@ -489,6 +624,7 @@ int main(int, char**) {
         return 1;
     }
     RefreshWindowSize();
+    LogDisplayState(true);
 
     input_android::OverlaySettings overlay{};
     input_android::InitOverlay(overlay);
