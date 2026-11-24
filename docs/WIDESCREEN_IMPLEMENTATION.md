@@ -95,6 +95,6 @@ Emitted once on startup and on every surface recreate, swapchain resize, or sett
 
 ```text
 [DISPLAY] physical=2400x1080 (density=3.00) sdl_window=2400x1080 output=2400x1080 display_aspect=2.2222 mode=Fullscreen No-Stretch (Adaptive)
-[RENDER] internal_guest=640x480 render_target=1280x960 render_scale=2.00x game_aspect=1.3333 output_aspect=2.2222 framing=Subtitle-Safe (70%) (pan=0.70, vcrop=40.0%)
-[VULKAN] swapchain=2400x1080 viewport=1280x960 scissor=(0,0 1280x960) src_blit=(43,190)-(1237,848) dst_blit=(0,0)-(2400,1080) scale_xy=(2.0101,1.9878) distortion=1.0112 surface_recreates=0
+[RENDER] internal_guest=640x480 render_target=1280x960 render_scale=2.00x game_aspect=1.3333 output_aspect=2.2222 framing=Subtitle-Safe (70%) (pan=0.70, vcrop=40.1%)
+[VULKAN] swapchain=2400x1080 viewport=1280x960 scissor=(0,0 1280x960) src_blit=(43,283)-(1237,820) dst_blit=(0,0)-(2400,1080) scale_xy=(2.0101,2.0112) distortion=0.9994 surface_recreates=0
 ```
