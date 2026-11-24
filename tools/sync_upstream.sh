@@ -33,4 +33,11 @@ fi
 
 echo "==> Applying patches/genma-android.patch..."
 (cd "$REPO_ROOT" && git apply --check patches/genma-android.patch && git apply patches/genma-android.patch)
+for extra_patch in "$REPO_ROOT"/patches/[0-9][0-9]-*.patch; do
+  if [[ -f "$extra_patch" ]]; then
+    rel_patch="patches/$(basename "$extra_patch")"
+    echo "==> Applying ${rel_patch}..."
+    (cd "$REPO_ROOT" && git apply --check "$rel_patch" && git apply "$rel_patch")
+  fi
+done
 echo "[OK] Upstream rafaelkenedy/genma-recomp synced and patched for Android ARM64."

@@ -32,11 +32,18 @@ def load_master() -> Image.Image:
 
 
 def make_round_icon(master: Image.Image, size: int) -> Image.Image:
-    # Crop inside the outer rounded-square gold rim (x=23..489 on 512x512 master)
-    inner = master.crop((23, 23, master.width - 23, master.height - 23))
-    inner = inner.resize((size, size), Image.Resampling.LANCZOS)
+    # Fit inner art inside a dark crimson circle backing (~74% of diameter, matching inscribed
+    # rounded square 1/sqrt(2)) so the metallic gold ring never clips "github/ekosaputro14".
+    rim_crop = max(1, round(master.width * (24.0 / 512.0)))
+    inner_src = master.crop((rim_crop, rim_crop, master.width - rim_crop, master.height - rim_crop))
+    inset_sz = round(size * 0.74)
+    inner = inner_src.resize((inset_sz, inset_sz), Image.Resampling.LANCZOS)
 
-    # Anti-aliased supersampled circle mask + metallic gold outer ring (#D4AF5A)
+    backed = Image.new("RGBA", (size, size), (0x18, 0x04, 0x10, 255))
+    pad = (size - inset_sz) // 2
+    backed.paste(inner, (pad, pad), inner)
+
+    # Anti-aliased supersampled circle mask + metallic multi-stop gold border ring
     ss = 4
     S = size * ss
     mask = Image.new("L", (S, S), 0)
@@ -45,41 +52,26 @@ def make_round_icon(master: Image.Image, size: int) -> Image.Image:
     mask = mask.resize((size, size), Image.Resampling.LANCZOS)
 
     out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    out.paste(inner, (0, 0), mask)
+    out.paste(backed, (0, 0), mask)
 
     ring = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     rd = ImageDraw.Draw(ring)
-    border_w = max(ss * 2, round(S * 0.045))
-    rd.ellipse((0, 0, S - 1, S - 1), outline=(212, 175, 90, 255), width=border_w)
-    # Subtle dark outer hairline + inner highlight for crisp contrast on white/dark launchers
-    rd.ellipse((0, 0, S - 1, S - 1), outline=(92, 62, 18, 220), width=max(2, ss))
+    border_w = max(ss * 2, round(S * 0.055))
+    rd.ellipse((0, 0, S - 1, S - 1), outline=(198, 151, 56, 255), width=border_w)
+    # Bright inner gold highlight + dark bronze outer rim to match master frame
+    inset = max(ss, border_w // 4)
+    rd.ellipse((inset, inset, S - 1 - inset, S - 1 - inset), outline=(245, 224, 142, 235), width=max(ss, border_w // 3))
+    rd.ellipse((0, 0, S - 1, S - 1), outline=(74, 46, 10, 245), width=max(2, ss))
     ring = ring.resize((size, size), Image.Resampling.LANCZOS)
     return Image.alpha_composite(out, ring)
 
 
 def make_foreground_icon(master: Image.Image, fg_size: int) -> Image.Image:
-    # For Adaptive Icons (Android 8+), launchers apply their own squircle/circle mask
-    # over a 108dp canvas (center 66dp..72dp visible). Cropping inside the baked gold frame
-    # and softly feathering into #190418 avoids double-border clipping on Pixel/MIUI/OneUI.
-    crop_pad = max(1, round(master.width * (46.0 / 512.0)))
-    inner = master.crop((crop_pad, crop_pad, master.width - crop_pad, master.height - crop_pad))
-    art_size = round(fg_size * 0.59)
-    art = inner.resize((art_size, art_size), Image.Resampling.LANCZOS)
-
-    # Feather the outer 12% of the square patch smoothly to transparent so it melts seamlessly
-    # into ic_launcher_background (#2C0818 -> #12030D) under every adaptive shape mask.
-    edge_px = max(4, round(art_size * 0.12))
-    apx = art.load()
-    for y in range(art_size):
-        dy = min(y, art_size - 1 - y)
-        ay = 1.0 if dy >= edge_px else (dy / edge_px)
-        for x in range(art_size):
-            dx = min(x, art_size - 1 - x)
-            ax = 1.0 if dx >= edge_px else (dx / edge_px)
-            w = ax * ay
-            if w < 1.0:
-                r, g, b, a = apx[x, y]
-                apx[x, y] = (r, g, b, round(a * w))
+    # Adaptive Icons (Android 8+) apply Circle / Squircle / Rounded-Square / Teardrop masks
+    # over a 108dp canvas (72dp visible aperture, 66dp guaranteed safe zone).
+    # art_size = 0.48 * fg_size preserves 100% of all 4 gold corners even under strict 66dp Circle masks.
+    art_size = round(fg_size * 0.48)
+    art = master.resize((art_size, art_size), Image.Resampling.LANCZOS)
 
     canvas = Image.new("RGBA", (fg_size, fg_size), (0, 0, 0, 0))
     off = (fg_size - art_size) // 2

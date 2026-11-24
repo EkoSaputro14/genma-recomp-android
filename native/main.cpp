@@ -53,6 +53,7 @@ std::atomic<bool> g_settings_loaded{false};
 std::atomic<bool> g_fill_no_stretch{false};
 std::atomic<float> g_wide_vertical_pan{0.70f};
 std::atomic<bool> g_indonesian_game{false};
+std::atomic<bool> g_gamepad_refresh_requested{false};
 std::mutex g_game_dir_lock;
 std::string g_game_dir;
 
@@ -153,6 +154,15 @@ void Dispatch(const SDL_Event& e) {
         case SDL_EVENT_LOW_MEMORY:
             LOGW("app: Android is low on memory");
             break;
+        case SDL_EVENT_GAMEPAD_ADDED:
+        case SDL_EVENT_GAMEPAD_REMOVED:
+            input::OnGamepadEvent(e.type, uint32_t(e.gdevice.which));
+            break;
+        case SDL_EVENT_JOYSTICK_ADDED:
+        case SDL_EVENT_JOYSTICK_REMOVED:
+        case SDL_EVENT_GAMEPAD_REMAPPED:
+            g_gamepad_refresh_requested.store(true);
+            break;
         case SDL_EVENT_FINGER_DOWN:
             input_android::OnTouchDown(int(e.tfinger.fingerID), e.tfinger.x, e.tfinger.y);
             break;
@@ -226,8 +236,18 @@ Java_com_genmarecomp_android_GenmaActivity_nativeLooseKey(JNIEnv*, jclass, jint 
         case 100: setAnalog(3); break;     // KEYCODE_BUTTON_Y
         case 103: setAnalog(4); break;     // KEYCODE_BUTTON_R1 (Black)
         case 102: setAnalog(5); break;     // KEYCODE_BUTTON_L1 (White)
+        case 104: setAnalog(6); break;     // KEYCODE_BUTTON_L2 (Left Trigger)
+        case 105: setAnalog(7); break;     // KEYCODE_BUTTON_R2 (Right Trigger)
         default: break;
     }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_genmarecomp_android_GenmaActivity_nativeRefreshGamepads(JNIEnv*, jclass) {
+    g_gamepad_refresh_requested.store(true);
+    SDL_Event wake{};
+    wake.type = SDL_EVENT_USER;
+    SDL_PushEvent(&wake);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -449,6 +469,7 @@ int main(int, char**) {
     SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
     SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
         __android_log_print(ANDROID_LOG_ERROR, "GENMA", "SDL_Init failed: %s", SDL_GetError());
         return 1;
@@ -494,6 +515,10 @@ int main(int, char**) {
         if (SDL_WaitEventTimeout(&e, 16)) {
             Dispatch(e);
             while (SDL_PollEvent(&e)) Dispatch(e);
+        }
+        if (g_gamepad_refresh_requested.exchange(false)) {
+            SDL_UpdateGamepads();
+            input::RefreshGamepads();
         }
         input::Pump();
         SyncTouchAndLoosePad();

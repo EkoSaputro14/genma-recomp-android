@@ -1,0 +1,113 @@
+diff --git a/sdk/runtime/core/input.cpp b/sdk/runtime/core/input.cpp
+index ebf0e25..cd25318 100644
+--- a/sdk/runtime/core/input.cpp
++++ b/sdk/runtime/core/input.cpp
+@@ -2,6 +2,7 @@
+ #include "core/input.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <iterator>
+ #include <mutex>
+ 
+@@ -66,9 +67,51 @@ void Pump() {
+         if (e.type == SDL_EVENT_GAMEPAD_ADDED) AddPad(e.gdevice.which);
+         else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) RemovePad(e.gdevice.which);
+     }
++    // Periodic safety reconciliation (~1s) catches Bluetooth/USB plug-ins even if an OEM event was coalesced.
++    static uint64_t last_sync_ms = 0;
++    const uint64_t now = SDL_GetTicks();
++    if (now - last_sync_ms >= 1000) {
++        last_sync_ms = now;
++        for (int i = 0; i < 4; i++) {
++            if (g_pads[i] && !SDL_GamepadConnected(g_pads[i])) {
++                SDL_CloseGamepad(g_pads[i]);
++                g_pads[i] = nullptr;
++                LOGI("input: controller %d disconnected (sync)", i + 1);
++            }
++        }
++        int count = 0;
++        if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
++            for (int i = 0; i < count; i++) AddPad(ids[i]);
++            SDL_free(ids);
++        }
++    }
+ #endif
+ }
+ 
++void OnGamepadEvent(uint32_t event_type, uint32_t which) {
++    std::lock_guard lock(g_lock);
++    if (!g_sdl) return;
++    if (event_type == SDL_EVENT_GAMEPAD_ADDED) AddPad(SDL_JoystickID(which));
++    else if (event_type == SDL_EVENT_GAMEPAD_REMOVED) RemovePad(SDL_JoystickID(which));
++}
++
++void RefreshGamepads() {
++    std::lock_guard lock(g_lock);
++    if (!g_sdl) return;
++    for (int i = 0; i < 4; i++) {
++        if (g_pads[i] && !SDL_GamepadConnected(g_pads[i])) {
++            SDL_CloseGamepad(g_pads[i]);
++            g_pads[i] = nullptr;
++            LOGI("input: controller %d disconnected (refresh)", i + 1);
++        }
++    }
++    int count = 0;
++    if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
++        for (int i = 0; i < count; i++) AddPad(ids[i]);
++        SDL_free(ids);
++    }
++}
++
+ void SetKeyboardPad(const Pad& pad) {
+     std::lock_guard lock(g_lock);
+     g_keyboard = pad;
+@@ -133,8 +176,13 @@ Pad Poll(int port) {
+             p.connected = true;
+             p.buttons |= g_keyboard.buttons;
+             for (int i = 0; i < 8; i++) p.analog[i] = std::max(p.analog[i], g_keyboard.analog[i]);
+-            if (g_keyboard.lx) p.lx = g_keyboard.lx;
+-            if (g_keyboard.ly) p.ly = g_keyboard.ly;
++            auto further = [](int16_t& dst, int16_t src) {
++                if (std::abs(int(src)) > std::abs(int(dst))) dst = src;
++            };
++            further(p.lx, g_keyboard.lx);
++            further(p.ly, g_keyboard.ly);
++            further(p.rx, g_keyboard.rx);
++            further(p.ry, g_keyboard.ry);
+         }
+     }
+     if (app::kGame.pad) app::kGame.pad(port, p);
+diff --git a/sdk/runtime/core/input.h b/sdk/runtime/core/input.h
+index b7f9e18..1e331c2 100644
+--- a/sdk/runtime/core/input.h
++++ b/sdk/runtime/core/input.h
+@@ -13,6 +13,8 @@ struct Pad {
+ 
+ void Init();  // window thread, before boot
+ void Pump();  // Linux: window thread owns SDL event pumping and gamepad hotplug
++void OnGamepadEvent(uint32_t event_type, uint32_t which);  // forward SDL_EVENT_GAMEPAD_ADDED/REMOVED from main loop
++void RefreshGamepads();                                    // sync g_pads[] with SDL_GetGamepads() on hotplug
+ void SetKeyboardPad(const Pad& pad);  // optional host keyboard controller, port 0
+ // the controller on that port, then GameInfo::pad
+ Pad Poll(int port);
+diff --git a/sdk/runtime/gpu/vulkan.cpp b/sdk/runtime/gpu/vulkan.cpp
+index 61c5c23..abd3482 100644
+--- a/sdk/runtime/gpu/vulkan.cpp
++++ b/sdk/runtime/gpu/vulkan.cpp
+@@ -2821,10 +2821,11 @@ void Vulkan::Present(const Surface &front) {
+     int sx0 = cx, sx1 = int(source.w) - cx;
+     int sy0 = cy, sy1 = int(source.h) - cy;
+ #ifdef __ANDROID__
+-    // 16:9 / Full-Screen No-Stretch ("Tanpa Gepeng"): keep 1:1 square pixels by vertically
+-    // cropping the 4:3 internal source instead of stretching it horizontally.
+-    const bool no_stretch_wide = (aspect > 0.0f && app::Widescreen()) || (aspect == 0.0f && host::FillNoStretch());
+-    if (no_stretch_wide && w > 0 && h > 0) {
++    // Only perform vertical zoom-crop when the user explicitly opts into Zoom-Crop mode
++    // (FillNoStretch). Standard 16:9 Widescreen and Full Screen Fill present 100% of the
++    // 640x480 frame with zero cut-off HUD, journals, or gameplay area.
++    const bool zoom_crop_wide = host::FillNoStretch() && (aspect == 0.0f || app::Widescreen());
++    if (zoom_crop_wide && w > 0 && h > 0) {
+         const int sw = sx1 - sx0;
+         const int sh = sy1 - sy0;
+         const float dst_aspect = float(w) / float(h);
