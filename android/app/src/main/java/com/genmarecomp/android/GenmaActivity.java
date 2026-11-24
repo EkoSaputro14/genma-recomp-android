@@ -690,8 +690,9 @@ public class GenmaActivity extends SDLActivity {
 
         List<String> gameLangLabels = new ArrayList<>();
         List<Integer> gameLangVals = new ArrayList<>();
-        gameLangLabels.add("English (Default)"); gameLangVals.add(0);
-        gameLangLabels.add("Bahasa Indonesia (Subtitle, Dialog, Item, 19 Dokumen)"); gameLangVals.add(1);
+        gameLangLabels.add("English (Original)"); gameLangVals.add(0);
+        gameLangLabels.add(tr("Bahasa Indonesia (Subtitles, Dialogue, Items)",
+                "Bahasa Indonesia (Subtitle, Dialog, Item, Menu)")); gameLangVals.add(1);
 
         box.addView(makeSectionLabel(ctx, tr("Game Subtitles & In-Game Text", "Bahasa Subtitle & Teks Game"), dp(12)));
         Spinner gameSpinner = makeSpinner(ctx, gameLangLabels, gameLangVals, curGameId ? 1 : 0);
