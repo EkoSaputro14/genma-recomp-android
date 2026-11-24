@@ -9,10 +9,13 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
+import android.hardware.input.InputManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.storage.StorageManager;
 import android.os.storage.StorageVolume;
 import android.provider.Settings;
@@ -25,6 +28,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
@@ -38,6 +42,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -45,10 +50,13 @@ import java.util.Locale;
 import org.libsdl.app.SDLActivity;
 import org.libsdl.app.SDLControllerManager;
 
-// SDL3 activity running libmain.so for Genma Onimusha (ARM64, Vulkan).
-// Preserves v0.8.0-android.9/10 defaults (1x Native 480p, 4:3, Bilinear, 60 FPS, V-Sync On, English)
-// while offering optional 16:9 / Full-Screen No-Stretch ("Tanpa Gepeng") + Vertical Framing,
-// full Bahasa Indonesia UI & In-Game Subtitles/Dialogues/Items/Menus, Touch Layout Editor, and Upscaling.
+/**
+ * SDL3 activity running libmain.so for Genma Onimusha (ARM64, Vulkan).
+ * Preserves v0.8.0 defaults (1x Native 480p, 4:3, Bilinear, 60 FPS, V-Sync On, English)
+ * while offering full-frame 16:9 widescreen (plus optional zoom-crop), instant in-game
+ * physical controller hot-plug, gear settings trigger, live touch opacity & button shape editing,
+ * community skin/layout import/export, and Bahasa Indonesia UI & in-game localization.
+ */
 public class GenmaActivity extends SDLActivity {
     static final String SHARED = "GenmaOnimusha";
     static final String PREFS_GRAPHICS = "genma_graphics";
@@ -59,16 +67,29 @@ public class GenmaActivity extends SDLActivity {
     static final String KEY_UI_LANG = "ui_lang";
     private static final String KEY_GAME_LANG_ID = "game_lang_id";
 
+    private static final int REQUEST_IMPORT_SKIN = 0x8A22;
+    private static final int REQUEST_EXPORT_SKIN = 0x8A23;
+
     private AlertDialog dialog;
     private boolean notNow;
     private final GameImporter importer = new GameImporter(this);
     private boolean importing;
     private TouchOverlayView touchOverlay;
 
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private InputManager inputManager;
+    private InputManager.InputDeviceListener inputDeviceListener;
+    private Method sdlPollInputMethod;
+    private boolean hadPhysicalGamepad = false;
+
     private View editToolbar;
     private TextView editSelLabel;
     private Button editMinusBtn;
     private Button editPlusBtn;
+    private Button editShapeBtn;
+    private TextView editOpacityLabel;
+    private SeekBar editOpacityBar;
+    private Button editSkinBtn;
     private Button editHideBtn;
     private Button editResetBtn;
     private Button editCancelBtn;
@@ -76,6 +97,7 @@ public class GenmaActivity extends SDLActivity {
     private Button editDockBtn;
     private boolean toolbarTop = false;
     private boolean lastSelHidden = false;
+    private TouchOverlayView.ButtonShape lastSelShape = TouchOverlayView.ButtonShape.CIRCLE;
 
     private static final boolean ALL_FILES_ACCESS = Build.VERSION.SDK_INT >= 30;
     private static final int STORAGE_REQUEST = 0x474D;
@@ -129,8 +151,10 @@ public class GenmaActivity extends SDLActivity {
                 }
 
                 @Override
-                public void onSelectionChanged(String label, float scale, boolean hidden, boolean canHide) {
-                    runOnUiThread(() -> updateEditToolbar(label, scale, hidden, canHide));
+                public void onSelectionChanged(
+                        String label, float scale, TouchOverlayView.ButtonShape shape,
+                        boolean hidden, boolean canHide) {
+                    runOnUiThread(() -> updateEditToolbar(label, scale, shape, hidden, canHide));
                 }
             });
             overlayHost.addView(touchOverlay, new RelativeLayout.LayoutParams(
@@ -153,9 +177,116 @@ public class GenmaActivity extends SDLActivity {
                     ViewGroup.LayoutParams.MATCH_PARENT));
         }
 
+        setupControllerHotplug();
+
         File own = getExternalFilesDir(null);
         if (own != null) {
             new File(own, "assets").mkdirs();
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (inputManager != null && inputDeviceListener != null) {
+            inputManager.unregisterInputDeviceListener(inputDeviceListener);
+            inputDeviceListener = null;
+        }
+        mainHandler.removeCallbacksAndMessages(null);
+        super.onDestroy();
+    }
+
+    private void setupControllerHotplug() {
+        try {
+            sdlPollInputMethod = SDLControllerManager.class.getDeclaredMethod("pollInputDevices");
+            sdlPollInputMethod.setAccessible(true);
+        } catch (Exception ignored) {
+        }
+        inputManager = getSystemService(InputManager.class);
+        if (inputManager == null) return;
+        hadPhysicalGamepad = hasConnectedPhysicalGamepad();
+        if (touchOverlay != null) touchOverlay.setPhysicalGamepadPresent(hadPhysicalGamepad);
+
+        inputDeviceListener = new InputManager.InputDeviceListener() {
+            @Override
+            public void onInputDeviceAdded(int deviceId) {
+                InputDevice dev = InputDevice.getDevice(deviceId);
+                refreshControllersNow(true);
+                if (isPhysicalGamepad(dev)) {
+                    hadPhysicalGamepad = true;
+                    String name = dev.getName() != null ? dev.getName() : "Gamepad";
+                    Toast.makeText(
+                            GenmaActivity.this,
+                            tr("Controller connected: ", "Controller terhubung: ") + name,
+                            Toast.LENGTH_SHORT).show();
+                }
+            }
+
+            @Override
+            public void onInputDeviceChanged(int deviceId) {
+                refreshControllersNow(false);
+            }
+
+            @Override
+            public void onInputDeviceRemoved(int deviceId) {
+                if (!mBrokenLibraries) {
+                    try {
+                        nativeLooseRelease();
+                    } catch (UnsatisfiedLinkError ignored) {
+                    }
+                }
+                refreshControllersNow(false);
+                boolean anyNow = hasConnectedPhysicalGamepad();
+                if (hadPhysicalGamepad && !anyNow) {
+                    Toast.makeText(
+                            GenmaActivity.this,
+                            tr("Controller disconnected", "Controller terputus"),
+                            Toast.LENGTH_SHORT).show();
+                }
+                hadPhysicalGamepad = anyNow;
+            }
+        };
+        inputManager.registerInputDeviceListener(inputDeviceListener, mainHandler);
+        refreshControllersNow(false);
+    }
+
+    private static boolean isPhysicalGamepad(InputDevice dev) {
+        if (dev == null || dev.isVirtual()) return false;
+        int src = dev.getSources();
+        boolean isPadSrc = (src & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+                || (src & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+        if (!isPadSrc) return false;
+        return !dev.getMotionRanges().isEmpty()
+                || dev.hasKeys(KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_START)[0];
+    }
+
+    private boolean hasConnectedPhysicalGamepad() {
+        for (int id : InputDevice.getDeviceIds()) {
+            if (isPhysicalGamepad(InputDevice.getDevice(id))) return true;
+        }
+        return false;
+    }
+
+    private void refreshControllersNow(boolean scheduleRetry) {
+        if (sdlPollInputMethod != null) {
+            try {
+                sdlPollInputMethod.invoke(null);
+            } catch (Exception ignored) {
+            }
+        }
+        if (!mBrokenLibraries) {
+            try {
+                nativeRefreshGamepads();
+            } catch (UnsatisfiedLinkError ignored) {
+            }
+        }
+        boolean anyNow = hasConnectedPhysicalGamepad();
+        hadPhysicalGamepad = anyNow;
+        if (touchOverlay != null) {
+            touchOverlay.setPhysicalGamepadPresent(anyNow);
+        }
+        if (scheduleRetry) {
+            // Bluetooth HID descriptors on Android 10-14 sometimes finish enumerating ~200-350ms after connect.
+            mainHandler.postDelayed(() -> refreshControllersNow(false), 350);
         }
     }
 
@@ -199,12 +330,54 @@ public class GenmaActivity extends SDLActivity {
         editPlusBtn.setOnClickListener(v -> touchOverlay.adjustSelectedScale(0.10f));
         bar.addView(editPlusBtn);
 
+        editShapeBtn = makeToolbarButton("Shape", Color.parseColor("#1E293B"), Color.WHITE);
+        editShapeBtn.setOnClickListener(v -> touchOverlay.cycleSelectedShape());
+        bar.addView(editShapeBtn);
+
+        editOpacityLabel = new TextView(this);
+        editOpacityLabel.setTextColor(Color.parseColor("#E2E8F0"));
+        editOpacityLabel.setTextSize(12f);
+        editOpacityLabel.setPadding(dp(8), 0, dp(4), 0);
+        bar.addView(editOpacityLabel);
+
+        editOpacityBar = new SeekBar(this);
+        editOpacityBar.setMax(90); // 10%..100%
+        LinearLayout.LayoutParams opLp = new LinearLayout.LayoutParams(dp(96), ViewGroup.LayoutParams.WRAP_CONTENT);
+        opLp.setMargins(0, 0, dp(4), 0);
+        editOpacityBar.setLayoutParams(opLp);
+        editOpacityBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
+                int pct = 10 + progress;
+                if (editOpacityLabel != null) {
+                    editOpacityLabel.setText(tr("Opacity ", "Transparansi ") + pct + "%");
+                }
+                if (fromUser && touchOverlay != null) {
+                    touchOverlay.setOverlayOpacity(pct / 100f);
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar sb) {}
+
+            @Override
+            public void onStopTrackingTouch(SeekBar sb) {}
+        });
+        bar.addView(editOpacityBar);
+
+        editSkinBtn = makeToolbarButton("Skin", Color.parseColor("#0F766E"), Color.WHITE);
+        editSkinBtn.setOnClickListener(v -> openSkinActionsDialog());
+        bar.addView(editSkinBtn);
+
         editHideBtn = makeToolbarButton("Hide", Color.parseColor("#1E293B"), Color.WHITE);
         editHideBtn.setOnClickListener(v -> touchOverlay.toggleSelectedHidden());
         bar.addView(editHideBtn);
 
         editResetBtn = makeToolbarButton("Reset", Color.parseColor("#7F1D1D"), Color.WHITE);
-        editResetBtn.setOnClickListener(v -> touchOverlay.resetToDefaults(false));
+        editResetBtn.setOnClickListener(v -> {
+            touchOverlay.resetToDefaults(false);
+            syncEditOpacityBar();
+        });
         bar.addView(editResetBtn);
 
         editCancelBtn = makeToolbarButton("Cancel", Color.parseColor("#334155"), Color.WHITE);
@@ -219,18 +392,33 @@ public class GenmaActivity extends SDLActivity {
         return scroll;
     }
 
+    private void syncEditOpacityBar() {
+        if (editOpacityBar == null || touchOverlay == null) return;
+        int pct = Math.max(10, Math.min(100, Math.round(touchOverlay.getOverlayOpacity() * 100f)));
+        editOpacityBar.setProgress(pct - 10);
+        if (editOpacityLabel != null) {
+            editOpacityLabel.setText(tr("Opacity ", "Transparansi ") + pct + "%");
+        }
+    }
+
     private void refreshEditToolbarLocale() {
         if (editDockBtn != null) {
             editDockBtn.setText(toolbarTop ? tr("▼ Bot", "▼ Bawah") : tr("▲ Top", "▲ Atas"));
         }
         if (editMinusBtn != null) editMinusBtn.setText(tr("− Size", "− Ukuran"));
         if (editPlusBtn != null) editPlusBtn.setText(tr("+ Size", "+ Ukuran"));
+        if (editShapeBtn != null) {
+            String shapeLabel = isId() ? lastSelShape.labelId : lastSelShape.labelEn;
+            editShapeBtn.setText(tr("Shape: ", "Bentuk: ") + shapeLabel);
+        }
+        if (editSkinBtn != null) editSkinBtn.setText(tr("Skin / Import", "Skin / Impor"));
         if (editHideBtn != null) {
             editHideBtn.setText(lastSelHidden ? tr("Show", "Tampil") : tr("Hide", "Sembunyi"));
         }
         if (editResetBtn != null) editResetBtn.setText("Reset");
         if (editCancelBtn != null) editCancelBtn.setText(tr("Cancel", "Batal"));
         if (editSaveBtn != null) editSaveBtn.setText(tr("Save", "Simpan"));
+        syncEditOpacityBar();
     }
 
     private Button makeToolbarButton(String label, int bgColor, int fgColor) {
@@ -270,11 +458,17 @@ public class GenmaActivity extends SDLActivity {
         refreshEditToolbarLocale();
     }
 
-    private void updateEditToolbar(String label, float scale, boolean hidden, boolean canHide) {
+    private void updateEditToolbar(
+            String label, float scale, TouchOverlayView.ButtonShape shape, boolean hidden, boolean canHide) {
         lastSelHidden = hidden;
+        lastSelShape = shape != null ? shape : TouchOverlayView.ButtonShape.CIRCLE;
         if (editSelLabel != null) {
             int pct = Math.round(scale * 100f);
             editSelLabel.setText(label + " " + pct + "%");
+        }
+        if (editShapeBtn != null) {
+            String shapeLabel = isId() ? lastSelShape.labelId : lastSelShape.labelEn;
+            editShapeBtn.setText(tr("Shape: ", "Bentuk: ") + shapeLabel);
         }
         if (editHideBtn != null) {
             editHideBtn.setEnabled(canHide);
@@ -285,8 +479,8 @@ public class GenmaActivity extends SDLActivity {
 
     private void startTouchEdit() {
         if (touchOverlay == null || editToolbar == null) return;
-        refreshEditToolbarLocale();
         touchOverlay.enterEditMode();
+        refreshEditToolbarLocale();
         editToolbar.setVisibility(View.VISIBLE);
     }
 
@@ -303,8 +497,8 @@ public class GenmaActivity extends SDLActivity {
     private void openQuickMenu() {
         if (touchOverlay == null) return;
         final String[] items = new String[] {
-                tr("Edit Touch Layout (Drag & Resize)", "Atur Tata Letak Sentuh (Geser & Ukuran)"),
-                tr("Touch Controls Preferences (Opacity & Scale)", "Preferensi Kontrol Sentuh (Opasitas & Skala)"),
+                tr("Edit Touch Layout (Drag, Size, Opacity & Shape)", "Atur Kontrol Sentuh (Geser, Ukuran, Transparansi & Bentuk)"),
+                tr("Touch Style & Community Skins (Import / Export)", "Gaya & Skin Komunitas Kontrol Sentuh (Impor / Ekspor)"),
                 tr("Graphics, 16:9 & Upscale Settings", "Pengaturan Grafis, 16:9 & Upscale"),
                 tr("Language / Bahasa (App & Game Subtitles)", "Bahasa / Language (Menu & Subtitle Game)")
         };
@@ -325,6 +519,135 @@ public class GenmaActivity extends SDLActivity {
                 .create();
         d.setOnDismissListener(dlg -> hideSystemBars());
         d.show();
+    }
+
+    private void openSkinActionsDialog() {
+        if (touchOverlay == null) return;
+        String activeName = TouchSkinManager.getActiveSkinName(this);
+        String activeSubtitle = activeName != null
+                ? tr("Active custom skin: ", "Skin kustom aktif: ") + activeName
+                : tr("No custom image skin active", "Belum ada skin gambar kustom");
+
+        final String[] items = new String[] {
+                tr("Visual Style Preset (Classic / Xbox Neon / Flat / Wireframe)", "Pilih Gaya Visual Bawaan (Klasik / Neon / Flat / Minimal)"),
+                tr("Import Community Skin / Layout (.zip, RetroArch .cfg, Winlator .icp, .json)", "Impor Skin / Layout Komunitas (.zip, RetroArch .cfg, Winlator .icp, .json)"),
+                tr("Export Current Layout (.json)", "Ekspor Tata Letak Saat Ini (.json)"),
+                tr("Clear Custom Skin Images (Keep Positions)", "Hapus Gambar Skin Kustom (Pertahankan Posisi)")
+        };
+        AlertDialog d = new AlertDialog.Builder(this)
+                .setTitle(tr("Controller Skins & Community Packs", "Skin Controller & Paket Komunitas"))
+                .setItems(items, (dlg, which) -> {
+                    if (which == 0) {
+                        openStylePresetPicker();
+                    } else if (which == 1) {
+                        openCommunitySkinImportPicker();
+                    } else if (which == 2) {
+                        startSkinExport();
+                    } else if (which == 3) {
+                        touchOverlay.clearCustomSkinOnly();
+                        Toast.makeText(this, tr("Custom skin cleared (" + activeSubtitle + ")", "Skin kustom dihapus"), Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton(tr("Close", "Tutup"), null)
+                .create();
+        d.setOnDismissListener(dlg -> hideSystemBars());
+        d.show();
+    }
+
+    private void openStylePresetPicker() {
+        if (touchOverlay == null) return;
+        TouchOverlayView.StylePreset[] all = TouchOverlayView.StylePreset.values();
+        String[] labels = new String[all.length];
+        int cur = 0;
+        for (int i = 0; i < all.length; i++) {
+            labels[i] = isId() ? all[i].labelId : all[i].labelEn;
+            if (all[i] == touchOverlay.getStylePreset()) cur = i;
+        }
+        AlertDialog d = new AlertDialog.Builder(this)
+                .setTitle(tr("Touch Button Visual Style", "Gaya Visual Tombol Sentuh"))
+                .setSingleChoiceItems(labels, cur, (dlg, which) -> {
+                    touchOverlay.setStylePreset(all[which]);
+                    if (!touchOverlay.isEditMode()) touchOverlay.saveLayout();
+                    dlg.dismiss();
+                })
+                .setNegativeButton(tr("Cancel", "Batal"), null)
+                .create();
+        d.setOnDismissListener(dlg -> hideSystemBars());
+        d.show();
+    }
+
+    private void openCommunitySkinImportPicker() {
+        List<File> localPacks = TouchSkinManager.findLocalSkinFiles();
+        if (localPacks.isEmpty()) {
+            launchSafSkinPicker();
+            return;
+        }
+        String[] labels = new String[localPacks.size() + 1];
+        labels[0] = tr("Browse device storage / Downloads (File Picker)...", "Pilih berkas dari Unduhan / Penyimpanan...");
+        for (int i = 0; i < localPacks.size(); i++) {
+            labels[i + 1] = "GenmaOnimusha/skins/" + localPacks.get(i).getName();
+        }
+        AlertDialog d = new AlertDialog.Builder(this)
+                .setTitle(tr("Import Community Touch Controller", "Impor Kontrol Sentuh Komunitas"))
+                .setItems(labels, (dlg, which) -> {
+                    if (which == 0) {
+                        launchSafSkinPicker();
+                    } else {
+                        importLocalSkinFile(localPacks.get(which - 1));
+                    }
+                })
+                .setNegativeButton(tr("Cancel", "Batal"), null)
+                .create();
+        d.setOnDismissListener(dlg -> hideSystemBars());
+        d.show();
+    }
+
+    private void launchSafSkinPicker() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        try {
+            startActivityForResult(i, REQUEST_IMPORT_SKIN);
+        } catch (ActivityNotFoundException e) {
+            Toast.makeText(this, tr("No file picker available", "Pemilih berkas tidak tersedia"), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void startSkinExport() {
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/json");
+        i.putExtra(Intent.EXTRA_TITLE, "genma-touch-layout.json");
+        try {
+            startActivityForResult(i, REQUEST_EXPORT_SKIN);
+        } catch (ActivityNotFoundException e) {
+            Toast.makeText(this, tr("No file picker available", "Pemilih berkas tidak tersedia"), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void importLocalSkinFile(File f) {
+        new Thread(() -> {
+            try {
+                TouchSkinManager.ImportedLayout res = TouchSkinManager.importFromFile(this, f);
+                mainHandler.post(() -> applyImportedLayoutResult(res));
+            } catch (Exception e) {
+                mainHandler.post(() -> Toast.makeText(
+                        this,
+                        tr("Import failed: ", "Gagal mengimpor: ") + e.getMessage(),
+                        Toast.LENGTH_LONG).show());
+            }
+        }, "GenmaSkinImport").start();
+    }
+
+    private void applyImportedLayoutResult(TouchSkinManager.ImportedLayout res) {
+        if (touchOverlay == null || res == null) return;
+        touchOverlay.applyImportedSkin(res);
+        syncEditOpacityBar();
+        Toast.makeText(
+                this,
+                tr("Imported ", "Diimpor: ") + res.packName + " (" + res.sourceFormat + ", "
+                        + res.controls.size() + tr(" controls)", " tombol)"),
+                Toast.LENGTH_LONG).show();
     }
 
     private void openLanguageDialog() {
@@ -434,8 +757,10 @@ public class GenmaActivity extends SDLActivity {
         box.setPadding(pad, dp(10), pad, dp(8));
 
         final boolean prevVisible = touchOverlay.isControlsVisible();
+        final boolean prevAutoHide = touchOverlay.isAutoHideOnGamepad();
         final float prevOpacity = touchOverlay.getOverlayOpacity();
         final float prevScale = touchOverlay.getGlobalScale();
+        final TouchOverlayView.StylePreset prevPreset = touchOverlay.getStylePreset();
         final boolean[] saved = {false};
 
         CheckBox showCheck = new CheckBox(ctx);
@@ -444,18 +769,23 @@ public class GenmaActivity extends SDLActivity {
         showCheck.setOnCheckedChangeListener((b, checked) -> touchOverlay.setControlsVisible(checked));
         box.addView(showCheck);
 
+        CheckBox autoHideCheck = new CheckBox(ctx);
+        autoHideCheck.setText(tr("Auto-hide buttons when physical controller connected", "Sembunyikan tombol saat controller fisik tersambung"));
+        autoHideCheck.setChecked(prevAutoHide);
+        box.addView(autoHideCheck);
+
         TextView opLabel = new TextView(ctx);
         opLabel.setPadding(0, dp(10), 0, dp(2));
         opLabel.setText(String.format(Locale.US, "%s: %d%%", tr("Opacity", "Transparansi"), Math.round(prevOpacity * 100f)));
         box.addView(opLabel);
 
         SeekBar opBar = new SeekBar(ctx);
-        opBar.setMax(80); // 20%..100%
-        opBar.setProgress(Math.max(0, Math.min(80, Math.round(prevOpacity * 100f) - 20)));
+        opBar.setMax(90); // 10%..100%
+        opBar.setProgress(Math.max(0, Math.min(90, Math.round(prevOpacity * 100f) - 10)));
         opBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
-                int pct = 20 + progress;
+                int pct = 10 + progress;
                 opLabel.setText(String.format(Locale.US, "%s: %d%%", tr("Opacity", "Transparansi"), pct));
                 touchOverlay.setOverlayOpacity(pct / 100f);
             }
@@ -492,27 +822,93 @@ public class GenmaActivity extends SDLActivity {
         });
         box.addView(scBar);
 
+        // Visual Style Preset spinner
+        TouchOverlayView.StylePreset[] presets = TouchOverlayView.StylePreset.values();
+        List<String> presetLabels = new ArrayList<>();
+        List<Integer> presetVals = new ArrayList<>();
+        for (int i = 0; i < presets.length; i++) {
+            presetLabels.add(isId() ? presets[i].labelId : presets[i].labelEn);
+            presetVals.add(i);
+        }
+        box.addView(makeSectionLabel(ctx, tr("Visual Style Preset", "Gaya Visual Tombol"), dp(10)));
+        Spinner presetSpinner = makeSpinner(ctx, presetLabels, presetVals, prevPreset.ordinal());
+        presetSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                touchOverlay.setStylePreset(presets[pos]);
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        box.addView(presetSpinner);
+
+        // Community skin/layout info & quick actions
+        String activeSkin = TouchSkinManager.getActiveSkinName(this);
+        box.addView(makeSectionLabel(ctx,
+                tr("Community Controller Skins / Layouts (.zip, RetroArch .cfg, Winlator .icp, .json)",
+                   "Skin / Tata Letak Komunitas (.zip, RetroArch .cfg, Winlator .icp, .json)"), dp(12)));
+        TextView skinStatus = new TextView(ctx);
+        skinStatus.setTextSize(12f);
+        skinStatus.setPadding(0, 0, 0, dp(6));
+        skinStatus.setText(activeSkin != null
+                ? tr("Active pack: ", "Paket aktif: ") + activeSkin
+                : tr("Active pack: Built-in vector style", "Paket aktif: Gaya vektor bawaan"));
+        box.addView(skinStatus);
+
+        LinearLayout skinRow = new LinearLayout(ctx);
+        skinRow.setOrientation(LinearLayout.HORIZONTAL);
+        Button importBtn = makeToolbarButton(tr("Import Skin/Layout", "Impor Skin/Layout"), Color.parseColor("#0F766E"), Color.WHITE);
+        Button exportBtn = makeToolbarButton(tr("Export .json", "Ekspor .json"), Color.parseColor("#1D4ED8"), Color.WHITE);
+        Button clearSkinBtn = makeToolbarButton(tr("Clear Skin", "Hapus Skin"), Color.parseColor("#475569"), Color.WHITE);
+        skinRow.addView(importBtn);
+        skinRow.addView(exportBtn);
+        skinRow.addView(clearSkinBtn);
+        box.addView(skinRow);
+
         scroll.addView(box);
 
         AlertDialog d = builder
-                .setTitle(tr("Touch Controls Preferences", "Preferensi Kontrol Sentuh"))
+                .setTitle(tr("Touch Controls & Skins", "Kontrol Sentuh & Skin Komunitas"))
                 .setView(scroll)
                 .setPositiveButton(tr("Save", "Simpan"), (dlg, w) -> {
                     saved[0] = true;
+                    touchOverlay.setAutoHideOnGamepad(autoHideCheck.isChecked());
                     touchOverlay.saveLayout();
                 })
                 .setNeutralButton(tr("Reset Defaults", "Reset Bawaan"), (dlg, w) -> {
                     saved[0] = true;
+                    touchOverlay.setAutoHideOnGamepad(false);
                     touchOverlay.resetToDefaults(true);
                     Toast.makeText(this, tr("Touch controls reset to default", "Kontrol sentuh dikembalikan ke bawaan"), Toast.LENGTH_SHORT).show();
                 })
                 .setNegativeButton(tr("Cancel", "Batal"), null)
                 .create();
+
+        importBtn.setOnClickListener(v -> {
+            saved[0] = true;
+            touchOverlay.saveLayout();
+            d.dismiss();
+            openCommunitySkinImportPicker();
+        });
+        exportBtn.setOnClickListener(v -> {
+            saved[0] = true;
+            touchOverlay.saveLayout();
+            d.dismiss();
+            startSkinExport();
+        });
+        clearSkinBtn.setOnClickListener(v -> {
+            touchOverlay.clearCustomSkinOnly();
+            skinStatus.setText(tr("Active pack: Built-in vector style", "Paket aktif: Gaya vektor bawaan"));
+            Toast.makeText(this, tr("Custom skin cleared", "Skin kustom dihapus"), Toast.LENGTH_SHORT).show();
+        });
+
         d.setOnDismissListener(dlg -> {
             if (!saved[0]) {
                 touchOverlay.setControlsVisible(prevVisible);
                 touchOverlay.setOverlayOpacity(prevOpacity);
                 touchOverlay.setGlobalScale(prevScale);
+                touchOverlay.setStylePreset(prevPreset);
             }
             hideSystemBars();
         });
@@ -620,21 +1016,33 @@ public class GenmaActivity extends SDLActivity {
         Spinner filterSpinner = makeSpinner(ctx, filterLabels, filterVals, curNearest ? 1 : 0);
         box.addView(filterSpinner);
 
-        // 3. Aspect Ratio (including 16:9 / Full Screen Tanpa Gepeng!)
+        // 3. Aspect Ratio: Standard 16:9 / Full Screen shows 100% of frame without zoom-crop!
         List<String> aspectLabels = new ArrayList<>();
         List<Integer> aspectChoiceVals = new ArrayList<>();
         // Encoded as aspect*10 + (fillNoStretch ? 1 : 0)
-        aspectLabels.add(tr("4:3 (Default)", "4:3 (Bawaan Asli)")); aspectChoiceVals.add(10);
-        aspectLabels.add(tr("16:9 (No Stretch / Tanpa Gepeng)", "16:9 (Tanpa Gepeng)")); aspectChoiceVals.add(20);
-        aspectLabels.add(tr("Auto (16:9 No Stretch)", "Otomatis (16:9 Tanpa Gepeng)")); aspectChoiceVals.add(0);
-        aspectLabels.add(tr("Full Screen (No Stretch / Tanpa Gepeng)", "Layar Penuh (Tanpa Gepeng)")); aspectChoiceVals.add(31);
-        aspectLabels.add(tr("Stretch (Fill Screen — Stretched)", "Rentangkan Penuh (Melar)")); aspectChoiceVals.add(30);
-        int curAspectChoice = curAspect * 10 + ((curAspect == 3 && curFillNoStretch) ? 1 : 0);
+        aspectLabels.add(tr("4:3 (Original — Default)", "4:3 (Asli — Bawaan)")); aspectChoiceVals.add(10);
+        aspectLabels.add(tr("16:9 (Widescreen — Full Frame, No Crop)", "16:9 (Layar Lebar — Penuh Tanpa Terpotong)")); aspectChoiceVals.add(20);
+        aspectLabels.add(tr("Full Screen (Fill Display — No Crop)", "Layar Penuh (Penuh Tanpa Terpotong)")); aspectChoiceVals.add(30);
+        aspectLabels.add(tr("16:9 Zoom Crop (1:1 Pixels, Crops Top/Bottom)", "16:9 Potong Atas/Bawah (Piksel 1:1)")); aspectChoiceVals.add(21);
+        aspectLabels.add(tr("Full Screen Zoom Crop (1:1 Pixels)", "Layar Penuh Potong Atas/Bawah (Piksel 1:1)")); aspectChoiceVals.add(31);
+
+        int mappedAspect = (curAspect == 0) ? 2 : curAspect; // Auto migrates cleanly to 16:9
+        int curAspectChoice = mappedAspect * 10 + ((mappedAspect >= 2 && curFillNoStretch) ? 1 : 0);
+        if (!aspectChoiceVals.contains(curAspectChoice)) curAspectChoice = 10;
+
         box.addView(makeSectionLabel(ctx, tr("Aspect Ratio", "Rasio Layar (Aspect Ratio)"), dp(10)));
         Spinner aspectSpinner = makeSpinner(ctx, aspectLabels, aspectChoiceVals, curAspectChoice);
         box.addView(aspectSpinner);
 
-        // 3b. Vertical Framing for 16:9 / Full Screen No-Stretch
+        TextView aspectNote = new TextView(ctx);
+        aspectNote.setTextSize(11f);
+        aspectNote.setPadding(0, dp(3), 0, dp(2));
+        aspectNote.setText(tr(
+                "Note: Genma Onimusha uses 640x480 pre-rendered room paintings. Choose 16:9 (Full Frame) or Full Screen (No Crop) so nothing is zoomed or cut off.",
+                "Catatan: Genma Onimusha memakai latar ruangan pra-render 640x480. Pilih 16:9 (Penuh Tanpa Terpotong) atau Layar Penuh agar HUD/area tidak terpotong."));
+        box.addView(aspectNote);
+
+        // 3b. Vertical Framing (only active when Zoom Crop mode is chosen)
         List<String> panLabels = new ArrayList<>();
         List<Integer> panVals = new ArrayList<>();
         panLabels.add(tr("25% — Top (HUD-Safe)", "25% — Atas (Aman untuk HUD)")); panVals.add(25);
@@ -645,10 +1053,29 @@ public class GenmaActivity extends SDLActivity {
             panLabels.add(curWidePanPct + "%");
             panVals.add(curWidePanPct);
         }
-        box.addView(makeSectionLabel(ctx,
-                tr("16:9 Vertical Position (No-Stretch Crop)", "Posisi Vertikal 16:9 (Tanpa Gepeng)"), dp(10)));
+        TextView panLabel = makeSectionLabel(ctx,
+                tr("Vertical Position (Zoom Crop Modes Only)", "Posisi Vertikal (Hanya Mode Potong Atas/Bawah)"), dp(10));
+        box.addView(panLabel);
         Spinner panSpinner = makeSpinner(ctx, panLabels, panVals, curWidePanPct);
         box.addView(panSpinner);
+
+        Runnable updatePanEnabled = () -> {
+            int selChoice = aspectChoiceVals.get(aspectSpinner.getSelectedItemPosition());
+            boolean isCropMode = (selChoice % 10) == 1;
+            panSpinner.setEnabled(isCropMode);
+            panSpinner.setAlpha(isCropMode ? 1.0f : 0.45f);
+            panLabel.setAlpha(isCropMode ? 1.0f : 0.45f);
+        };
+        aspectSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                updatePanEnabled.run();
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        updatePanEnabled.run();
 
         // 4. Anisotropic Filtering
         List<String> anisoLabels = new ArrayList<>();
@@ -775,7 +1202,10 @@ public class GenmaActivity extends SDLActivity {
     // Visual virtual touch overlay bridge -> native/main.cpp
     private static native void nativeTouchPad(int buttons, byte[] analog, short lx, short ly);
 
-    // Graphics, 16:9 no-stretch & localization bridge -> native/main.cpp
+    // Hotplug gamepad refresh wake -> native/main.cpp
+    private static native void nativeRefreshGamepads();
+
+    // Graphics, 16:9 no-crop / zoom-crop & localization bridge -> native/main.cpp
     private static native void nativeSetRenderOptions(float renderScale, boolean nearestPresent);
     private static native void nativeSetExtendedOptions(boolean fillNoStretch, float widePan, boolean indonesianGame);
     private static native int[] nativeGetGraphicsSettings();
@@ -836,6 +1266,7 @@ public class GenmaActivity extends SDLActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        refreshControllersNow(false);
         askForGame();
     }
 
@@ -844,6 +1275,7 @@ public class GenmaActivity extends SDLActivity {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) {
             hideSystemBars();
+            refreshControllersNow(false);
         } else if (!mBrokenLibraries) {
             nativeLooseRelease();
         }
@@ -976,6 +1408,46 @@ public class GenmaActivity extends SDLActivity {
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQUEST_IMPORT_SKIN) {
+            Uri uri = (resultCode == RESULT_OK && data != null) ? data.getData() : null;
+            if (uri != null) {
+                new Thread(() -> {
+                    try {
+                        TouchSkinManager.ImportedLayout res = TouchSkinManager.importFromUri(this, uri);
+                        mainHandler.post(() -> applyImportedLayoutResult(res));
+                    } catch (Exception e) {
+                        mainHandler.post(() -> Toast.makeText(
+                                this,
+                                tr("Import failed: ", "Gagal mengimpor: ") + e.getMessage(),
+                                Toast.LENGTH_LONG).show());
+                    }
+                }, "GenmaSkinImport").start();
+            }
+            hideSystemBars();
+            return;
+        }
+        if (requestCode == REQUEST_EXPORT_SKIN) {
+            Uri uri = (resultCode == RESULT_OK && data != null) ? data.getData() : null;
+            if (uri != null && touchOverlay != null) {
+                String json = touchOverlay.exportLayoutJson();
+                new Thread(() -> {
+                    try {
+                        TouchSkinManager.exportToUri(this, uri, json);
+                        mainHandler.post(() -> Toast.makeText(
+                                this,
+                                tr("Touch layout exported", "Tata letak sentuh berhasil diekspor"),
+                                Toast.LENGTH_SHORT).show());
+                    } catch (Exception e) {
+                        mainHandler.post(() -> Toast.makeText(
+                                this,
+                                tr("Export failed: ", "Gagal mengekspor: ") + e.getMessage(),
+                                Toast.LENGTH_LONG).show());
+                    }
+                }, "GenmaSkinExport").start();
+            }
+            hideSystemBars();
+            return;
+        }
         if (requestCode != GameImporter.REQUEST) {
             super.onActivityResult(requestCode, resultCode, data);
             return;
