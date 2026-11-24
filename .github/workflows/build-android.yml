@@ -147,7 +147,12 @@ jobs:
         run: |
           mkdir -p release-dist
           APK_SRC=$(find android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
-          APK_OUT="release-dist/GenmaOnimusha-${{ steps.ver.outputs.tag }}-android-arm64-v8a.apk"
+          TAG="${{ steps.ver.outputs.tag }}"
+          if [[ "$TAG" == *-android ]]; then
+            APK_OUT="release-dist/GenmaOnimusha-${TAG}-arm64-v8a.apk"
+          else
+            APK_OUT="release-dist/GenmaOnimusha-${TAG}-android-arm64-v8a.apk"
+          fi
           cp "$APK_SRC" "$APK_OUT"
           (cd release-dist && sha256sum * > SHA256SUMS)
           ls -lh release-dist
