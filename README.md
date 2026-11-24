@@ -48,15 +48,16 @@
 
 ## Device Compatibility Matrix (Call for Testers!)
 
-We are actively collecting test reports — **especially on MediaTek Dimensity/Helio (Mali & Immortalis), Samsung Exynos, and Google Tensor** devices in `v0.8.0-android.8`+!
+We are actively collecting test reports — **Mali-G52 is now verified playable at 60 FPS**, and we welcome more tests on **MediaTek Dimensity/Helio (Mali & Immortalis)**, **Samsung Exynos**, **Google Tensor**, and **Qualcomm Snapdragon (Adreno)** devices in `v0.8.15-android`+!
 
 | Device Model | SoC / GPU | Android Version | APK Version | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Xiaomi POCO X3 NFC (`M2007J20CG`) | Snapdragon 732G (`SM7150`) / Adreno 618 | Android 12 (API 31) | `v0.8.0-android.7` | Playable (up to 60 FPS) | Verified with CPU BC decode fallback; minor scene-dependent slowdowns remain |
-| MediaTek Dimensity / Helio | Mali / Immortalis | Android 10–15 | `v0.8.0-android.8` | **Untested — Testers Needed!** | Needs verification for `D32_SFLOAT_S8_UINT` depth-stencil & `R8G8B8A8_UNORM` swapchain |
-| Samsung Galaxy (Exynos) | Mali / Xclipse | Android 10–15 | `v0.8.0-android.8` | **Untested — Testers Needed!** | Needs `genma.log` & visual feedback |
-| Google Pixel (Tensor) | Mali / Immortalis | Android 12–15 | `v0.8.0-android.8` | **Untested — Testers Needed!** | Needs `genma.log` & visual feedback |
-| Snapdragon 6xx / 7xx / 8xx (Adreno) | Adreno 6xx / 7xx | Android 10–15 | `v0.8.0-android.8` | **Partially Tested** | Report FPS & scene performance on newer Adreno GPUs |
+| Xiaomi POCO X3 NFC (`M2007J20CG`) | Snapdragon 732G (`SM7150`) / Adreno 618 | Android 12 (API 31) | `v0.8.15-android` | **Playable (60 FPS)** | Verified up to `2x (1280×960)` + `8x` Aniso & full `2400×1080` cutout swapchain with CPU BC decode fallback |
+| Xiaomi Redmi 14C (`2409BRN2CY`) | MediaTek Helio G81 Ultra (`MT6769`) / Mali-G52 MC2 | Android 16 (API 36) | `v0.8.0-android.9+` | **Playable (Smooth 60 FPS)** | Verified via [Issue #1](https://github.com/EkoSaputro14/genma-recomp-android/issues/1) (`@NoviceHunter95`): Mali WAW/subpass fix resolved black screen; smooth 60 FPS gameplay reported (`1640×720`, `fmt=37`, CPU BC decode fallback) |
+| MediaTek Dimensity / Helio (Other Mali / Immortalis) | Mali / Immortalis | Android 10–16 | `v0.8.15-android` | **Partially Tested — More Testers Needed!** | Mali-G52 verified; still collecting `D32_SFLOAT_S8_UINT` & `R8G8B8A8_UNORM` reports on newer Dimensity/Immortalis GPUs |
+| Samsung Galaxy (Exynos) | Mali / Xclipse | Android 10–15 | `v0.8.15-android` | **Untested — Testers Needed!** | Needs `genma.log` & visual feedback |
+| Google Pixel (Tensor) | Mali / Immortalis | Android 12–15 | `v0.8.15-android` | **Untested — Testers Needed!** | Needs `genma.log` & visual feedback |
+| Snapdragon 6xx / 7xx / 8xx (Adreno) | Adreno 6xx / 7xx | Android 10–15 | `v0.8.15-android` | **Partially Tested** | Report FPS & scene performance on newer Adreno GPUs |
 
 👉 **Tested on your phone?** Please open a [**Device Test Report**](https://github.com/EkoSaputro14/genma-recomp-android/issues/new?template=device_test_report.yml) with your SoC/GPU model and `genma.log`!
 
