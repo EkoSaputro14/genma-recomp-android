@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Tag versi rilis Android (contoh: v0.8.0-android.13)'
+        description: 'Tag versi rilis Android (contoh: v0.8.14-android)'
         required: true
-        default: 'v0.8.0-android.13'
+        default: 'v0.8.14-android'
         type: string
       publish_release:
         description: 'Publikasikan langsung ke GitHub Releases'
@@ -124,7 +124,7 @@ jobs:
         run: |
           VERSION="${{ inputs.release_version || github.ref_name }}"
           if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
-            VERSION="v0.8.0-android.13"
+            VERSION="v0.8.14-android"
           fi
           CLEAN_NAME="${VERSION#v}"
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
@@ -171,16 +171,18 @@ jobs:
           body: |
             ### Genma Onimusha — Android ARM64 Port (${{ steps.ver.outputs.tag }})
 
-            > **Catatan Pembaruan**: Rilis ini menambahkan translasi Bahasa Indonesia untuk seluruh dokumen bacaan in-game (*Jurnal*, *Catatan Sougen*, *Surat Yuki*, *Petunjuk*, dan *Buku*) serta ikon aplikasi APK baru (*Onimusha Genma*). Dapat langsung di-install menimpa `v0.8.0-android.9 / .10 / .11 / .12` tanpa perlu uninstall APK lama (`hasFragileUserData="true"` dan keystore rilis konsisten). Pengaturan grafis default tetap sama (`1x` Native 480p, `4:3`, V-Sync On, 60 FPS, Bilinear).
+            > **Catatan Pembaruan**: Rilis `v0.8.14-android` (penamaan versi bersih tanpa angka ekor ambigu) memperbaiki mode **16:9 Widescreen** agar tidak lagi men-zoom/memotong area gameplay, mengganti tombol **`CFG`** menjadi **ikon gerigi (`⚙`)**, menambahkan dukungan **controller Bluetooth/USB *hot-plug* langsung saat *in-game***, **pengaturan transparansi tombol langsung di editor sentuh (`10%–100%`)**, **editor bentuk tombol + impor/ekspor skin & layout komunitas** (RetroArch `.zip`/`.cfg`, Winlator `.icp`, Genma `.json`/`.zip`), serta memperbarui **ikon APK dengan bingkai emas utuh**. Dapat langsung di-install menimpa versi sebelumnya tanpa uninstall (`hasFragileUserData="true"`). Pengaturan default tetap aman (`1x` Native 480p, `4:3`, V-Sync On, 60 FPS, Bilinear).
 
-            - **Fitur Baru pada Rilis Ini (`v0.8.0-android.13`)**:
-              - **Translasi Bahasa Indonesia Lengkap untuk 19 Dokumen In-Game (`native/lang_id_docs_data.h` + renderer `OIM ` 4bpp *on-the-fly* di `native/lang_id.cpp`)**:
-                - Merender teks Bahasa Indonesia ber-*outline* secara *runtime* (tanpa mengubah file ISO) ke atas tekstur transparan **19 arsip dokumen**: `E_TEGAMI.LDT`, `FILE00E.LDT` (*Surat Putri Yuki*), `FILE01E/E2/E3.LDT` (*Petunjuk Tipe A/B/C*), `FILE02E.LDT` (*Catatan Sougen*), `FILE03E–08E.LDT` (*Jurnal #1–#6*), `FILE09E–0DE.LDT` (*Buku Biru #1–#5*), `FILE0EE.LDT` (*Buku Merah*), dan `FILE0FE.LDT` (*Buku Raja Iblis*), sambil membiarkan ilustrasi latar (`.bg`) dan elemen UI tetap utuh.
-                - **4 kunci sandi Ogre** (`FILE10E–13E` & `E_BUN0–3`) sengaja dipertahankan persis aslinya agar seluruh teka-teki peti kombinasi tetap 100% akurat dan dapat diselesaikan.
-              - **Ikon Aplikasi APK Baru (`Adaptive` + `Legacy` + `Round`)**: ikon *Onimusha Genma* berbingkai emas bersih tanpa sudut putih untuk Android 10–15 (`hdpi–xxxhdpi` + `mipmap-anydpi-v26`).
-            - **Perbaikan & Fitur dari Rilis Sebelumnya**:
-              - Mempertahankan penuh **2-byte opcode `0xF0 <arg>`** (`v0.8.0-android.12`) untuk mencegah *softlock* cutscene/dialog di seluruh `.rdt`/`.ldt` dan tabel XBE.
-              - Mode **16:9 / Layar Penuh Tanpa Gepeng**, **Upscale `0.75x–3x`**, serta **Touch Layout Editor** (`CFG`).
+            - **Fitur & Perbaikan Baru pada `v0.8.14-android`**:
+              - **Perbaikan Mode 16:9 / Layar Penuh Tanpa Zoom Terpotong**: Mode `16:9 (Widescreen — Full Frame, No Crop)` dan `Full Screen (No Crop)` kini menampilkan 100% area layar tanpa memotong HUD, jurnal, maupun area aksi (berbeda dari mesin 3D FPS *Black*, *Genma Onimusha* memakai latar 2D pra-render 640×480 sehingga *pan-and-scan* otomatis sebelumnya meng-crop 25–40% vertikal); mode *Zoom Crop (Piksel 1:1)* tetap tersedia sebagai opsi terpisah lengkap dengan *Vertical Position*.
+              - **In-Game Physical Controller Hot-Plug**: Meneruskan event `SDL_EVENT_GAMEPAD_ADDED` / `REMOVED` & `InputManager.InputDeviceListener` secara *real-time* saat game sudah berjalan sehingga controller Bluetooth/USB langsung terdeteksi tanpa restart (ditambah sinkronisasi analog kanan & `L2`/`R2` untuk controller virtual OEM).
+              - **Ikon Pengaturan Gerigi (`⚙`), Editor Transparansi, Editor Bentuk Tombol & Impor Skin Komunitas**:
+                - Ikon `CFG` diganti ikon **gerigi (`⚙`)**.
+                - Slider **Transparansi (`10%–100%`)** dan tombol **Bentuk Tombol (`Circle` / `Rounded` / `Pill` / `Hexagon` / `Minimal Ring`)** serta pilihan **Gaya Visual** (`Classic`, `Xbox Neon`, `PlayStation Flat`, `Minimal Wire`) kini tersedia langsung di toolbar **Atur Tata Letak Sentuh** dengan pratinjau langsung.
+                - **Impor / Ekspor Kontrol Sentuh Komunitas**: mendukung format **RetroArch Overlay (`.zip`/`.cfg` + sprite `.png`)**, **Winlator (`.icp`)**, dan **Genma Touch Pack (`.json`/`.zip`)** melalui pemilih berkas Android (SAF).
+              - **Ikon Aplikasi APK Baru Berbingkai Emas Utuh**: mempertahankan 100% *gold border* + watermark `github/ekosaputro14` secara utuh di seluruh mask Adaptive Icon Android 10–15 (`Circle`, `Squircle`, `Rounded Square`, `Teardrop`) tanpa *cropping* atau halo putih.
+            - **Tetap Mempertahankan Fitur Sebelumnya (`v0.8.0-android.13` ke bawah)**:
+              - Translasi Bahasa Indonesia lengkap untuk menu, subtitle cutscene/dialog, item, pilihan (`0xF0 <arg>`-safe), & 19 dokumen `OIM `, plus `0.75x–3x` upscale dan fallback Vulkan Mali/Exynos.
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`, 16 KB page-aligned
           files: |
             release-dist/*.apk
