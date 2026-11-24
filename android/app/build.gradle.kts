@@ -23,8 +23,8 @@ android {
         applicationId = "com.genmarecomp.android"
         minSdk = 29
         targetSdk = 34
-        versionCode = if (project.hasProperty("versionCode")) project.property("versionCode").toString().toInt() else 84
-        versionName = if (project.hasProperty("versionName")) project.property("versionName").toString() else "0.8.14-android"
+        versionCode = if (project.hasProperty("versionCode")) project.property("versionCode").toString().toInt() else 85
+        versionName = if (project.hasProperty("versionName")) project.property("versionName").toString() else "0.8.15-android"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
