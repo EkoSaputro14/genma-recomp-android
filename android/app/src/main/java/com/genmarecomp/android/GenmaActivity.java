@@ -28,6 +28,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
@@ -62,6 +63,7 @@ public class GenmaActivity extends SDLActivity {
     static final String PREFS_GRAPHICS = "genma_graphics";
     private static final String KEY_SCALE_PCT = "scale_pct";
     private static final String KEY_NEAREST = "nearest_present";
+    private static final String KEY_DISPLAY_MODE = "display_mode";
     private static final String KEY_FILL_NO_STRETCH = "fill_no_stretch";
     private static final String KEY_WIDE_PAN_PCT = "wide_pan_pct";
     static final String KEY_UI_LANG = "ui_lang";
@@ -120,17 +122,22 @@ public class GenmaActivity extends SDLActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        configureTrueFullscreen();
 
         SharedPreferences gp = getSharedPreferences(PREFS_GRAPHICS, Context.MODE_PRIVATE);
         int savedScalePct = gp.getInt(KEY_SCALE_PCT, 100);
         boolean savedNearest = gp.getBoolean(KEY_NEAREST, false);
-        boolean savedFillNoStretch = gp.getBoolean(KEY_FILL_NO_STRETCH, false);
+        int savedDisplayMode = gp.getInt(KEY_DISPLAY_MODE, -1);
+        if (savedDisplayMode < 0 || savedDisplayMode > 2) {
+            savedDisplayMode = gp.getBoolean(KEY_FILL_NO_STRETCH, false) ? 2 : 0;
+        }
         int savedWidePanPct = gp.getInt(KEY_WIDE_PAN_PCT, 70);
         boolean savedGameLangId = gp.getBoolean(KEY_GAME_LANG_ID, false);
         if (!mBrokenLibraries) {
             try {
                 nativeSetRenderOptions(savedScalePct / 100.0f, savedNearest);
-                nativeSetExtendedOptions(savedFillNoStretch, savedWidePanPct / 100.0f, savedGameLangId);
+                nativeSetExtendedOptions(savedDisplayMode != 0, savedWidePanPct / 100.0f, savedGameLangId);
+                nativeSetDisplayMode(savedDisplayMode, savedWidePanPct / 100.0f);
             } catch (UnsatisfiedLinkError ignored) {
             }
         }
@@ -683,9 +690,8 @@ public class GenmaActivity extends SDLActivity {
 
         List<String> gameLangLabels = new ArrayList<>();
         List<Integer> gameLangVals = new ArrayList<>();
-        gameLangLabels.add("English (Original)"); gameLangVals.add(0);
-        gameLangLabels.add(tr("Bahasa Indonesia (Subtitles, Dialogue, Items)",
-                "Bahasa Indonesia (Subtitle, Dialog, Item, Menu)")); gameLangVals.add(1);
+        gameLangLabels.add("English (Default)"); gameLangVals.add(0);
+        gameLangLabels.add("Bahasa Indonesia (Subtitle, Dialog, Item, 19 Dokumen)"); gameLangVals.add(1);
 
         box.addView(makeSectionLabel(ctx, tr("Game Subtitles & In-Game Text", "Bahasa Subtitle & Teks Game"), dp(12)));
         Spinner gameSpinner = makeSpinner(ctx, gameLangLabels, gameLangVals, curGameId ? 1 : 0);
@@ -949,9 +955,13 @@ public class GenmaActivity extends SDLActivity {
             }
         }
         if (cur == null || cur.length < 14) {
+            int fallbackMode = gp.getInt(KEY_DISPLAY_MODE, -1);
+            if (fallbackMode < 0 || fallbackMode > 2) {
+                fallbackMode = gp.getBoolean(KEY_FILL_NO_STRETCH, false) ? 2 : 0;
+            }
             cur = new int[] {
                     gp.getInt(KEY_SCALE_PCT, 100),
-                    1,
+                    fallbackMode == 1 ? 2 : (fallbackMode == 2 ? 3 : 1),
                     0,
                     1,
                     60,
@@ -961,9 +971,10 @@ public class GenmaActivity extends SDLActivity {
                     gp.getBoolean(KEY_NEAREST, false) ? 1 : 0,
                     1,
                     1,
-                    gp.getBoolean(KEY_FILL_NO_STRETCH, false) ? 1 : 0,
+                    fallbackMode != 0 ? 1 : 0,
                     gp.getInt(KEY_WIDE_PAN_PCT, 70),
-                    gp.getBoolean(KEY_GAME_LANG_ID, false) ? 1 : 0
+                    gp.getBoolean(KEY_GAME_LANG_ID, false) ? 1 : 0,
+                    fallbackMode
             };
         }
 
@@ -978,9 +989,11 @@ public class GenmaActivity extends SDLActivity {
         final boolean curNearest = cur[8] != 0;
         final boolean curModern = cur[9] != 0;
         final int maxAniso = Math.max(1, cur[10]);
-        final boolean curFillNoStretch = cur[11] != 0;
         final int curWidePanPct = cur[12];
         final boolean curGameLangId = cur[13] != 0;
+        final int curDisplayMode = (cur.length >= 15)
+                ? Math.max(0, Math.min(2, cur[14]))
+                : ((curAspect == 2) ? 1 : (curAspect == 3 ? 2 : 0));
 
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
         Context ctx = builder.getContext();
@@ -1016,55 +1029,49 @@ public class GenmaActivity extends SDLActivity {
         Spinner filterSpinner = makeSpinner(ctx, filterLabels, filterVals, curNearest ? 1 : 0);
         box.addView(filterSpinner);
 
-        // 3. Aspect Ratio: Standard 16:9 / Full Screen shows 100% of frame without zoom-crop!
+        // 3. Display Strategy (strictly zero-stretch 1:1 pixels across all 3 modes)
         List<String> aspectLabels = new ArrayList<>();
-        List<Integer> aspectChoiceVals = new ArrayList<>();
-        // Encoded as aspect*10 + (fillNoStretch ? 1 : 0)
-        aspectLabels.add(tr("4:3 (Original — Default)", "4:3 (Asli — Bawaan)")); aspectChoiceVals.add(10);
-        aspectLabels.add(tr("16:9 (Widescreen — Full Frame, No Crop)", "16:9 (Layar Lebar — Penuh Tanpa Terpotong)")); aspectChoiceVals.add(20);
-        aspectLabels.add(tr("Full Screen (Fill Display — No Crop)", "Layar Penuh (Penuh Tanpa Terpotong)")); aspectChoiceVals.add(30);
-        aspectLabels.add(tr("16:9 Zoom Crop (1:1 Pixels, Crops Top/Bottom)", "16:9 Potong Atas/Bawah (Piksel 1:1)")); aspectChoiceVals.add(21);
-        aspectLabels.add(tr("Full Screen Zoom Crop (1:1 Pixels)", "Layar Penuh Potong Atas/Bawah (Piksel 1:1)")); aspectChoiceVals.add(31);
+        List<Integer> modeVals = new ArrayList<>();
+        aspectLabels.add(tr("4:3 Native (Original — Default)", "4:3 Asli (Proporsi Asli — Bawaan)")); modeVals.add(0);
+        aspectLabels.add(tr("16:9 Widescreen (No-Stretch, 1:1 Pixels)", "16:9 Layar Lebar (Tanpa Gepeng, Piksel 1:1)")); modeVals.add(1);
+        aspectLabels.add(tr("Fullscreen No-Stretch (Adaptive, Zero Black Bars)", "Layar Penuh Tanpa Gepeng (Adaptif, Tanpa Bilah Hitam)")); modeVals.add(2);
 
-        int mappedAspect = (curAspect == 0) ? 2 : curAspect; // Auto migrates cleanly to 16:9
-        int curAspectChoice = mappedAspect * 10 + ((mappedAspect >= 2 && curFillNoStretch) ? 1 : 0);
-        if (!aspectChoiceVals.contains(curAspectChoice)) curAspectChoice = 10;
-
-        box.addView(makeSectionLabel(ctx, tr("Aspect Ratio", "Rasio Layar (Aspect Ratio)"), dp(10)));
-        Spinner aspectSpinner = makeSpinner(ctx, aspectLabels, aspectChoiceVals, curAspectChoice);
+        box.addView(makeSectionLabel(ctx, tr("Display / Widescreen Mode", "Mode Layar / Widescreen"), dp(10)));
+        Spinner aspectSpinner = makeSpinner(ctx, aspectLabels, modeVals, curDisplayMode);
         box.addView(aspectSpinner);
 
         TextView aspectNote = new TextView(ctx);
         aspectNote.setTextSize(11f);
         aspectNote.setPadding(0, dp(3), 0, dp(2));
         aspectNote.setText(tr(
-                "Note: Genma Onimusha uses 640x480 pre-rendered room paintings. Choose 16:9 (Full Frame) or Full Screen (No Crop) so nothing is zoomed or cut off.",
-                "Catatan: Genma Onimusha memakai latar ruangan pra-render 640x480. Pilih 16:9 (Penuh Tanpa Terpotong) atau Layar Penuh agar HUD/area tidak terpotong."));
+                "All modes preserve 1:1 pixel proportions (zero stretching). 16:9 & Fullscreen No-Stretch use Vertical Framing below so HUD/subtitles stay visible.",
+                "Semua mode menjaga proporsi piksel 1:1 (tanpa gepeng). Mode 16:9 & Layar Penuh Tanpa Gepeng memakai Posisi Vertikal di bawah agar HUD/subtitle tetap terlihat."));
         box.addView(aspectNote);
 
-        // 3b. Vertical Framing (only active when Zoom Crop mode is chosen)
+        // 3b. Vertical Framing (active for 16:9 Widescreen & Fullscreen No-Stretch)
         List<String> panLabels = new ArrayList<>();
         List<Integer> panVals = new ArrayList<>();
-        panLabels.add(tr("25% — Top (HUD-Safe)", "25% — Atas (Aman untuk HUD)")); panVals.add(25);
-        panLabels.add(tr("50% — Center (Standard / 16:9 FMV)", "50% — Tengah (Standar / Video 16:9)")); panVals.add(50);
+        panLabels.add(tr("0% — Top (Full Upper HUD)", "0% — Atas (Top / HUD Atas Penuh)")); panVals.add(0);
+        panLabels.add(tr("25% — HUD-Safe", "25% — Aman HUD")); panVals.add(25);
+        panLabels.add(tr("50% — Center (Standard / 16:9 FMV)", "50% — Tengah (Center / Video 16:9)")); panVals.add(50);
         panLabels.add(tr("70% — Subtitle-Safe (Default)", "70% — Aman Subtitle (Bawaan)")); panVals.add(70);
-        panLabels.add(tr("90% — Bottom (Full Subtitle)", "90% — Bawah (Subtitle Penuh)")); panVals.add(90);
+        panLabels.add(tr("100% — Bottom (Full Lower Subtitle)", "100% — Bawah (Bottom / Subtitle Penuh)")); panVals.add(100);
         if (!panVals.contains(curWidePanPct)) {
             panLabels.add(curWidePanPct + "%");
             panVals.add(curWidePanPct);
         }
         TextView panLabel = makeSectionLabel(ctx,
-                tr("Vertical Position (Zoom Crop Modes Only)", "Posisi Vertikal (Hanya Mode Potong Atas/Bawah)"), dp(10));
+                tr("Vertical Framing (16:9 / Fullscreen No-Stretch)", "Posisi Vertikal (Mode 16:9 / Layar Penuh Tanpa Gepeng)"), dp(10));
         box.addView(panLabel);
         Spinner panSpinner = makeSpinner(ctx, panLabels, panVals, curWidePanPct);
         box.addView(panSpinner);
 
         Runnable updatePanEnabled = () -> {
-            int selChoice = aspectChoiceVals.get(aspectSpinner.getSelectedItemPosition());
-            boolean isCropMode = (selChoice % 10) == 1;
-            panSpinner.setEnabled(isCropMode);
-            panSpinner.setAlpha(isCropMode ? 1.0f : 0.45f);
-            panLabel.setAlpha(isCropMode ? 1.0f : 0.45f);
+            int selMode = modeVals.get(aspectSpinner.getSelectedItemPosition());
+            boolean isWideMode = (selMode != 0);
+            panSpinner.setEnabled(isWideMode);
+            panSpinner.setAlpha(isWideMode ? 1.0f : 0.45f);
+            panLabel.setAlpha(isWideMode ? 1.0f : 0.45f);
         };
         aspectSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
@@ -1153,9 +1160,9 @@ public class GenmaActivity extends SDLActivity {
                 .setPositiveButton(tr("Apply & Save", "Simpan & Terapkan"), (dlg, w) -> {
                     int scalePct = scaleVals.get(scaleSpinner.getSelectedItemPosition());
                     boolean nearest = filterVals.get(filterSpinner.getSelectedItemPosition()) != 0;
-                    int aspectChoice = aspectChoiceVals.get(aspectSpinner.getSelectedItemPosition());
-                    int aspect = aspectChoice / 10;
-                    boolean fillNoStretch = (aspectChoice % 10) != 0;
+                    int displayMode = modeVals.get(aspectSpinner.getSelectedItemPosition());
+                    int aspect = (displayMode == 1) ? 2 : (displayMode == 2 ? 3 : 1);
+                    boolean fillNoStretch = (displayMode != 0);
                     int widePanPct = panVals.get(panSpinner.getSelectedItemPosition());
                     int aniso = anisoVals.get(anisoSpinner.getSelectedItemPosition());
                     int overscanX100 = overscanVals.get(overscanSpinner.getSelectedItemPosition());
@@ -1168,6 +1175,7 @@ public class GenmaActivity extends SDLActivity {
                     gp.edit()
                             .putInt(KEY_SCALE_PCT, scalePct)
                             .putBoolean(KEY_NEAREST, nearest)
+                            .putInt(KEY_DISPLAY_MODE, displayMode)
                             .putBoolean(KEY_FILL_NO_STRETCH, fillNoStretch)
                             .putInt(KEY_WIDE_PAN_PCT, widePanPct)
                             .apply();
@@ -1183,6 +1191,7 @@ public class GenmaActivity extends SDLActivity {
                     gp.edit()
                             .putInt(KEY_SCALE_PCT, 100)
                             .putBoolean(KEY_NEAREST, false)
+                            .putInt(KEY_DISPLAY_MODE, 0)
                             .putBoolean(KEY_FILL_NO_STRETCH, false)
                             .putInt(KEY_WIDE_PAN_PCT, 70)
                             .apply();
@@ -1205,8 +1214,9 @@ public class GenmaActivity extends SDLActivity {
     // Hotplug gamepad refresh wake -> native/main.cpp
     private static native void nativeRefreshGamepads();
 
-    // Graphics, 16:9 no-crop / zoom-crop & localization bridge -> native/main.cpp
+    // Graphics, true widescreen / no-stretch display mode & localization bridge -> native/main.cpp
     private static native void nativeSetRenderOptions(float renderScale, boolean nearestPresent);
+    private static native void nativeSetDisplayMode(int displayMode, float widePan);
     private static native void nativeSetExtendedOptions(boolean fillNoStretch, float widePan, boolean indonesianGame);
     private static native int[] nativeGetGraphicsSettings();
     private static native void nativeApplyGraphicsSettings(
@@ -1266,6 +1276,7 @@ public class GenmaActivity extends SDLActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        hideSystemBars();
         refreshControllersNow(false);
         askForGame();
     }
@@ -1279,6 +1290,19 @@ public class GenmaActivity extends SDLActivity {
         } else if (!mBrokenLibraries) {
             nativeLooseRelease();
         }
+    }
+
+    private void configureTrueFullscreen() {
+        if (getWindow() == null) return;
+        WindowManager.LayoutParams lp = getWindow().getAttributes();
+        if (Build.VERSION.SDK_INT >= 30) {
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+            getWindow().setDecorFitsSystemWindows(false);
+        } else if (Build.VERSION.SDK_INT >= 28) {
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        }
+        getWindow().setAttributes(lp);
+        hideSystemBars();
     }
 
     @SuppressWarnings("deprecation")
