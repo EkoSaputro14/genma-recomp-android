@@ -1,7 +1,7 @@
 # Genma Onimusha — Android ARM64 Port
 
 [![Build & Release Android APK (ARM64)](https://github.com/EkoSaputro14/genma-recomp-android/actions/workflows/build-android.yml/badge.svg)](https://github.com/EkoSaputro14/genma-recomp-android/actions/workflows/build-android.yml)
-[![Latest Release](https://img.shields.io/github/v/release/EkoSaputro14/genma-recomp-android?include_prereleases&label=Release&color=blue)](https://github.com/EkoSaputro14/genma-recomp-android/releases/latest)
+[![Latest Release](https://img.shields.io/github/v/release/EkoSaputro14/genma-recomp-android?label=Release&color=blue)](https://github.com/EkoSaputro14/genma-recomp-android/releases/latest)
 [![Platform](https://img.shields.io/badge/Android-10%2B%20(ARM64%20%7C%20Vulkan%201.1)-3DDC84?logo=android&logoColor=white)](https://github.com/EkoSaputro14/genma-recomp-android/releases)
 [![GitHub Stars](https://img.shields.io/github/stars/EkoSaputro14/genma-recomp-android?style=social)](https://github.com/EkoSaputro14/genma-recomp-android/stargazers)
 
