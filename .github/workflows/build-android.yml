@@ -165,7 +165,7 @@ jobs:
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: "Genma Onimusha Android ARM64 ${{ steps.ver.outputs.tag }}"
-          prerelease: true
+          prerelease: false
           make_latest: true
           generate_release_notes: true
           body: |
