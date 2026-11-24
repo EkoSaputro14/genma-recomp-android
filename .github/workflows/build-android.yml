@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Tag versi rilis Android (contoh: v0.8.14-android)'
+        description: 'Tag versi rilis Android (contoh: v0.8.15-android)'
         required: true
-        default: 'v0.8.14-android'
+        default: 'v0.8.15-android'
         type: string
       publish_release:
         description: 'Publikasikan langsung ke GitHub Releases'
@@ -124,7 +124,7 @@ jobs:
         run: |
           VERSION="${{ inputs.release_version || github.ref_name }}"
           if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
-            VERSION="v0.8.14-android"
+            VERSION="v0.8.15-android"
           fi
           CLEAN_NAME="${VERSION#v}"
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
@@ -176,18 +176,14 @@ jobs:
           body: |
             ### Genma Onimusha — Android ARM64 Port (${{ steps.ver.outputs.tag }})
 
-            > **Catatan Pembaruan**: Rilis `v0.8.14-android` (penamaan versi bersih tanpa angka ekor ambigu) memperbaiki mode **16:9 Widescreen** agar tidak lagi men-zoom/memotong area gameplay, mengganti tombol **`CFG`** menjadi **ikon gerigi (`⚙`)**, menambahkan dukungan **controller Bluetooth/USB *hot-plug* langsung saat *in-game***, **pengaturan transparansi tombol langsung di editor sentuh (`10%–100%`)**, **editor bentuk tombol + impor/ekspor skin & layout komunitas** (RetroArch `.zip`/`.cfg`, Winlator `.icp`, Genma `.json`/`.zip`), serta memperbarui **ikon APK dengan bingkai emas utuh**. Dapat langsung di-install menimpa versi sebelumnya tanpa uninstall (`hasFragileUserData="true"`). Pengaturan default tetap aman (`1x` Native 480p, `4:3`, V-Sync On, 60 FPS, Bilinear).
+            > **Catatan Pembaruan (`v0.8.15-android`)**: Perbaikan menyeluruh arsitektur **True Fullscreen Edge-to-Edge & 16:9 / No-Stretch Widescreen** di seluruh pipeline Android → SDL3 → Vulkan (`display_math.h`, `settings.cpp`, `vulkan.cpp`, `GenmaActivity`, `styles.xml`). Mode **4:3 Native**, **16:9 Widescreen (No-Stretch)**, dan **Fullscreen No-Stretch (Adaptive)** kini menjaga proporsi piksel **1:1 tanpa gepeng** di rasio layar apa pun (`16:9`, `18:9`, `19.5:9`, `20:9+`), mendukung *display cutout / notch*, 5 preset **Vertical Framing** (`Top 0%` / `HUD-Safe 25%` / `Center 50%` / `Subtitle-Safe 70%` / `Bottom 100%`), serta upscaling `0.75x–3x` bebas distorsi. Default instalasi baru tetap aman (`1x` Native 480p, `4:3`, V-Sync On, 60 FPS, Bilinear).
 
-            - **Fitur & Perbaikan Baru pada `v0.8.14-android`**:
-              - **Perbaikan Mode 16:9 / Layar Penuh Tanpa Zoom Terpotong**: Mode `16:9 (Widescreen — Full Frame, No Crop)` dan `Full Screen (No Crop)` kini menampilkan 100% area layar tanpa memotong HUD, jurnal, maupun area aksi (berbeda dari mesin 3D FPS *Black*, *Genma Onimusha* memakai latar 2D pra-render 640×480 sehingga *pan-and-scan* otomatis sebelumnya meng-crop 25–40% vertikal); mode *Zoom Crop (Piksel 1:1)* tetap tersedia sebagai opsi terpisah lengkap dengan *Vertical Position*.
-              - **In-Game Physical Controller Hot-Plug**: Meneruskan event `SDL_EVENT_GAMEPAD_ADDED` / `REMOVED` & `InputManager.InputDeviceListener` secara *real-time* saat game sudah berjalan sehingga controller Bluetooth/USB langsung terdeteksi tanpa restart (ditambah sinkronisasi analog kanan & `L2`/`R2` untuk controller virtual OEM).
-              - **Ikon Pengaturan Gerigi (`⚙`), Editor Transparansi, Editor Bentuk Tombol & Impor Skin Komunitas**:
-                - Ikon `CFG` diganti ikon **gerigi (`⚙`)**.
-                - Slider **Transparansi (`10%–100%`)** dan tombol **Bentuk Tombol (`Circle` / `Rounded` / `Pill` / `Hexagon` / `Minimal Ring`)** serta pilihan **Gaya Visual** (`Classic`, `Xbox Neon`, `PlayStation Flat`, `Minimal Wire`) kini tersedia langsung di toolbar **Atur Tata Letak Sentuh** dengan pratinjau langsung.
-                - **Impor / Ekspor Kontrol Sentuh Komunitas**: mendukung format **RetroArch Overlay (`.zip`/`.cfg` + sprite `.png`)**, **Winlator (`.icp`)**, dan **Genma Touch Pack (`.json`/`.zip`)** melalui pemilih berkas Android (SAF).
-              - **Ikon Aplikasi APK Baru Berbingkai Emas Utuh**: mempertahankan 100% *gold border* + watermark `github/ekosaputro14` secara utuh di seluruh mask Adaptive Icon Android 10–15 (`Circle`, `Squircle`, `Rounded Square`, `Teardrop`) tanpa *cropping* atau halo putih.
-            - **Tetap Mempertahankan Fitur Sebelumnya (`v0.8.0-android.13` ke bawah)**:
-              - Translasi Bahasa Indonesia lengkap untuk menu, subtitle cutscene/dialog, item, pilihan (`0xF0 <arg>`-safe), & 19 dokumen `OIM `, plus `0.75x–3x` upscale dan fallback Vulkan Mali/Exynos.
+            - **Perbaikan Pipeline Display & Vulkan pada `v0.8.15-android`**:
+              - **Zero-Stretch Presentation (`ComputePresentPlan`)**: Menghilangkan peregangan horizontal `+33%–67%` pada blit Vulkan; mode `16:9 Widescreen` dan `Fullscreen No-Stretch` mengisi layar lebar dengan piksel persegi 1:1 yang proporsional.
+              - **True Immersive Cutout Fullscreen**: `windowLayoutInDisplayCutoutMode=shortEdges` / `LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS` + `setDecorFitsSystemWindows(false)` dan `hideSystemBars()` sejak `onCreate()` / `onResume()`, sehingga area *notch/punch-hole* terpakai penuh tanpa *letterbox* OS.
+              - **Live Physical Swapchain & Display Detection (`ScreenMode` + `WindowPixels`)**: Menghapus inisialisasi `1280×720` statis dan cache `0×0` pada `Desktop()`/`Widescreen()`; `Vulkan::Resize()` membaca dimensi piksel aktual langsung dari window SDL3 secara *real-time*.
+              - **5 Preset Vertical Framing Aktif**: `0% Top`, `25% HUD-Safe`, `50% Center`, `70% Subtitle-Safe`, dan `100% Bottom` menggeser jendela framing vertikal secara nyata pada mode `16:9` maupun `Fullscreen No-Stretch`.
+              - **Diagnostik `[DISPLAY]` / `[RENDER]` / `[VULKAN]`** di `genma.log` & `logcat` + fallback GPU **Mali / Immortalis / Exynos** (`D32_SFLOAT_S8_UINT`, swapchain non-sRGB, decode DXT CPU, *WAW barrier*), kontrol sentuh & impor skin komunitas, controller *hot-plug* in-game, dan lokalisasi Bahasa Indonesia tetap utuh.
             - **Target Minimum**: Android 10+ (API 29+), ABI `arm64-v8a`, 16 KB page-aligned
           files: |
             release-dist/*.apk
